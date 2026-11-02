@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from zephon_modal.job import ElasticJob
-from zephon_modal.verify.compare import format_report
+from zephon_modal.verify.compare import format_report, identical
 
 DEFAULT_JOB_ATTRIBUTE = "job"
 
@@ -60,7 +60,7 @@ def _compare(args: argparse.Namespace) -> None:
     job = load_job(args.job)
     rows = job.compare(args.reference, args.candidate)
     print(format_report(rows))
-    if not all(row["match"] for row in rows):
+    if not identical(rows):
         raise SystemExit(1)
 
 

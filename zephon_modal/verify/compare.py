@@ -16,6 +16,12 @@ from typing import Any
 
 from zephon_modal.verify.hashes import SAMPLE_HASH_SUBDIR
 
+MATCH = "match"
+MISMATCH = "MISMATCH"
+REFERENCE_ONLY = "only in reference"
+CANDIDATE_ONLY = "only in candidate"
+STATUSES = (MATCH, MISMATCH, REFERENCE_ONLY, CANDIDATE_ONLY)
+
 
 def load_step_digests(sample_hash_dir: str) -> dict[int, dict[str, Any]]:
     """Fold one run's hash files into ``{step: {digest, rows, dp}}``.
@@ -54,19 +60,40 @@ def compare_runs(reference_dir: str, candidate_dir: str) -> list[dict[str, Any]]
             "reference_dp": ref.get(step, {}).get("dp"),
             "candidate_dp": cand.get(step, {}).get("dp"),
             "rows": cand.get(step, ref.get(step, {})).get("rows"),
-            "match": step in ref and step in cand and ref[step]["digest"] == cand[step]["digest"],
+            "status": _status(ref.get(step), cand.get(step)),
         }
         for step in sorted(ref.keys() | cand.keys())
     ]
 
 
+def _status(ref: dict[str, Any] | None, cand: dict[str, Any] | None) -> str:
+    if ref is None:
+        return CANDIDATE_ONLY
+    if cand is None:
+        return REFERENCE_ONLY
+    return MATCH if ref["digest"] == cand["digest"] else MISMATCH
+
+
+def identical(rows: list[dict[str, Any]]) -> bool:
+    """Whether the runs share at least one step and agree on every step they share.
+
+    Steps only one run trained (a shorter candidate, or one that went further
+    than the reference) can't be checked, so they don't count either way.
+    """
+    statuses = [row["status"] for row in rows]
+    return MATCH in statuses and MISMATCH not in statuses
+
+
 def format_report(rows: list[dict[str, Any]]) -> str:
     """One line per step, then a summary."""
     lines = [
-        f"step {row['step']:>4}  dp {row['reference_dp']} vs {row['candidate_dp']}  rows {row['rows']}  "
-        + ("match" if row["match"] else "MISMATCH")
+        f"step {row['step']:>4}  dp {row['reference_dp']} vs {row['candidate_dp']}  rows {row['rows']}  {row['status']}"
         for row in rows
     ]
-    matched = sum(row["match"] for row in rows)
-    lines.append(f"{matched}/{len(rows)} steps identical")
+    counts = {status: sum(row["status"] == status for row in rows) for status in STATUSES}
+    shared = counts[MATCH] + counts[MISMATCH]
+    unchecked = [f"{counts[status]} {status}" for status in (REFERENCE_ONLY, CANDIDATE_ONLY) if counts[status]]
+    lines.append(
+        f"{counts[MATCH]}/{shared} shared steps identical" + (f" ({', '.join(unchecked)})" if unchecked else "")
+    )
     return "\n".join(lines)

@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 
 from zephon_modal.adapters.base import Adapter
@@ -104,7 +105,8 @@ def torchrun_command(adapter: Adapter, ctx: LaunchContext, topology: NodeTopolog
     ]
 
 
-def _node_topology(placement: Placement) -> NodeTopology:
+def node_topology(placement: Placement) -> NodeTopology:
+    """This container's place in the launch, from Modal's cluster info on multi-node placements."""
     if placement.nodes == 1:
         return NodeTopology(nnodes=1, node_rank=0, master_addr=None)
     import modal
@@ -146,29 +148,49 @@ def _record_launch(spec: RunSpec, ctx: LaunchContext) -> None:
         json.dump(record, launch_file, indent=2)
 
 
-def train_node(spec: RunSpec) -> list[str]:
-    """Run one node of a launch; returns the checkpoint steps present afterwards."""
-    import modal
+def start_trainer(
+    spec: RunSpec, topology: NodeTopology, extra_env: Mapping[str, str] | None = None
+) -> subprocess.Popen:
+    """Record the launch and start torchrun for this node.
 
-    topology = _node_topology(spec.placement)
+    Pair with :func:`finish_launch` once the trainer exits. ``extra_env``
+    reaches every trainer process (e.g. profiling switches).
+    """
     ctx = launch_context(spec, topology)
     os.makedirs(spec.run_dir, exist_ok=True)
     _record_launch(spec, ctx)
-    env = os.environ | spec.adapter.env(ctx) | _compile_cache_env(spec) | ctx.to_env()
+    env = os.environ | spec.adapter.env(ctx) | _compile_cache_env(spec) | dict(extra_env or {}) | ctx.to_env()
     command = torchrun_command(spec.adapter, ctx, topology)
     print(f"[zephon_modal] {spec.run_id} launch {spec.launch_id} on {spec.placement.name}: {' '.join(command)}")
-    try:
-        subprocess.run(command, cwd=spec.adapter.workdir(), env=env, check=True)
-    finally:
-        if os.path.isdir(LOCAL_SAMPLE_HASH_DIR):
-            shutil.copytree(LOCAL_SAMPLE_HASH_DIR, f"{spec.run_dir}/{SAMPLE_HASH_SUBDIR}", dirs_exist_ok=True)
-        # Make whatever checkpoints exist visible to the next container even if
-        # training failed partway through.
-        modal.Volume.from_name(spec.runs_volume).commit()
-        if spec.compile_cache_volume is not None:
-            modal.Volume.from_name(spec.compile_cache_volume).commit()
+    return subprocess.Popen(command, cwd=spec.adapter.workdir(), env=env)
+
+
+def finish_launch(spec: RunSpec) -> list[str]:
+    """Move sample hashes into the run and commit Volumes; returns the checkpoint steps present.
+
+    Call it whether or not training succeeded, so the next container sees
+    whatever checkpoints exist.
+    """
+    import modal
+
+    if os.path.isdir(LOCAL_SAMPLE_HASH_DIR):
+        shutil.copytree(LOCAL_SAMPLE_HASH_DIR, f"{spec.run_dir}/{SAMPLE_HASH_SUBDIR}", dirs_exist_ok=True)
+    modal.Volume.from_name(spec.runs_volume).commit()
+    if spec.compile_cache_volume is not None:
+        modal.Volume.from_name(spec.compile_cache_volume).commit()
     checkpoint_dir = f"{spec.run_dir}/{CHECKPOINT_SUBDIR}"
     return sorted(os.listdir(checkpoint_dir)) if os.path.isdir(checkpoint_dir) else []
+
+
+def train_node(spec: RunSpec) -> list[str]:
+    """Run one node of a launch; returns the checkpoint steps present afterwards."""
+    trainer = start_trainer(spec, node_topology(spec.placement))
+    try:
+        if trainer.wait():
+            raise subprocess.CalledProcessError(trainer.returncode, trainer.args)
+    finally:
+        checkpoints = finish_launch(spec)
+    return checkpoints
 
 
 def compare(runs_mount: str, runs_volume: str, reference: str, candidate: str) -> list[dict]:
