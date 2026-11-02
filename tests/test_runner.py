@@ -9,11 +9,12 @@ def _spec(placement: Placement, adapter=None) -> RunSpec:
         run_id="r1",
         steps=20,
         seed=42,
+        canonical_replicas=16,
         launch_id="20261102T000000",
         placement=placement,
         adapter=adapter or Torchtitan(module="recipes", config="smoke"),
         runs_mount="/runs",
-        runs_volume="runs",
+        runs_volume_name="runs",
     )
 
 

@@ -1,7 +1,7 @@
 # Copyright 2026 DatologyAI
 # SPDX-License-Identifier: Apache-2.0
 
-"""Physical shapes a run can train on, and which of them a run's lanes allow."""
+"""Physical shapes a run can train on, and which of them a run's canonical replicas allow."""
 
 from __future__ import annotations
 
@@ -66,11 +66,11 @@ class Placement:
             )
         return dp
 
-    def check_lanes(self, lanes: int, model_parallel_size: int = 1) -> None:
+    def check_canonical_replicas(self, canonical_replicas: int, model_parallel_size: int = 1) -> None:
         """Raise unless this placement's DP degree divides the run's Zephon lane count."""
         dp = self.dp_size(model_parallel_size)
-        if lanes % dp:
+        if canonical_replicas % dp:
             raise ValueError(
-                f"Placement {self.name} gives DP={dp}, which doesn't divide lanes={lanes}; "
-                "Zephon can only resume on DP degrees that divide canonical_replicas"
+                f"Placement {self.name} gives DP={dp}, which doesn't divide canonical_replicas={canonical_replicas}; "
+                "Zephon can only train and resume on DP degrees that divide it"
             )

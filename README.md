@@ -13,14 +13,15 @@ checkpoint handling that survives preemption, and `tune` come next (see
 
 ## How it fits together
 
-- **Lanes, not ranks.** Zephon divides the data into `lanes`
+- **Lanes, not ranks.** Zephon divides the data into lanes
   (`canonical_replicas`). A run can train or resume on any data-parallel
   degree that divides the lane count, so 16 lanes allow DP 1, 2, 4, 8 or 16.
 - **Placements** are physical shapes, in order of preference:
   `Placement("H100:8", nodes=2)`, `Placement("H100:4", nonpreemptible=True)`, ...
   Each one becomes its own Modal function (`train-<placement>`), because
   Modal fixes a function's GPU spec and cluster size when it's defined.
-  `ElasticJob` rejects placements whose DP degree doesn't divide the lanes.
+  `ElasticJob` rejects placements whose DP degree doesn't divide
+  `canonical_replicas`.
 - **Adapters** say how to launch a framework's trainer under torchrun:
   `Torchtitan` (torchtitan-zephon) and `Megatron` (Megatron-LM-zephon).
   Adapters are plain data. Recipe-specific code is named by import string and
@@ -43,11 +44,11 @@ job = ElasticJob(
     name="qwen3-smoke",
     image=training_image,  # framework + zephon>=0.2.1 + your recipe modules
     adapter=Torchtitan(module="my_recipes", config="qwen3_0p6b_zephon_smoke"),
-    lanes=16,
+    canonical_replicas=16,
     placements=[Placement("H100:8", nodes=2), Placement("H100:8"), Placement("H100:4")],
-    runs_volume="my-runs",
+    runs_volume=modal.Volume.from_name("my-runs", create_if_missing=True, version=2),
     volumes={"/data": modal.Volume.from_name("my-data")},
-    compile_cache_volume="my-compile-cache",
+    compile_cache_volume=modal.Volume.from_name("my-compile-cache", create_if_missing=True, version=2),
 )
 ```
 
@@ -59,7 +60,7 @@ take `run_id`, `aggregate_store` / `aggregate_dir`, the step target and
 returns `pretrain_gpt_zephon.py`'s arguments.
 
 The recipe must still consume whole lane windows per optimizer step
-(microbatches per step a multiple of `lanes`). Zephon only warns about this,
+(microbatches per step a multiple of `canonical_replicas`). Zephon only warns about this,
 so check it in the recipe.
 
 ## Commands

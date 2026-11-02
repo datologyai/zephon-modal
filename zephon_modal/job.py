@@ -28,27 +28,38 @@ def new_launch_id() -> str:
     return time.strftime("%Y%m%dT%H%M%S", time.gmtime())
 
 
-@dataclass
+def _volume_name(volume: modal.Volume) -> str:
+    """Containers commit and reload these Volumes by name, so they must have one."""
+    if not volume.name:
+        raise ValueError("runs_volume and compile_cache_volume must be named Volumes (modal.Volume.from_name)")
+    return volume.name
+
+
+@dataclass(frozen=True, eq=False)
 class ElasticJob:
     """A training recipe that can run, and resume, on any of several placements.
 
     Building one registers a Modal function per placement (plus a CPU
     ``compare`` function) on :attr:`app`, so a job file is also a normal Modal
-    app module.
+    app module. It's frozen: those functions are built from the fields once,
+    so changing a field afterwards would silently do nothing.
 
     Attributes:
         name: Modal app name.
         image: Training image. It needs the framework, Zephon >= 0.2.1 and
             the recipe modules; ``zephon_modal`` itself is added here.
         adapter: How to launch the framework's trainer.
-        lanes: Zephon ``canonical_replicas``. Every placement's DP degree must
-            divide it, and the recipe must consume whole lane windows per step.
+        canonical_replicas: Zephon's ``canonical_replicas`` (the run's lanes).
+            Every placement's DP degree must divide it, and the recipe must
+            consume whole lane windows per step.
         placements: Physical shapes, in order of preference.
-        runs_volume: Name of the Volume holding runs (created as a v2 Volume
-            if missing: every rank writes its own checkpoint shard).
+        runs_volume: Volume holding runs, mounted at ``/runs``. Use a named v2
+            Volume (``modal.Volume.from_name(..., version=2)``): every rank
+            writes its own checkpoint shard, and containers commit it by name.
         volumes: Extra mounts, e.g. training data.
-        compile_cache_volume: Optional Volume name for torch.compile caches,
-            which every relaunch would otherwise rebuild.
+        compile_cache_volume: Optional named v2 Volume for torch.compile
+            caches, which every relaunch would otherwise rebuild (Inductor
+            writes cache entries via rename from many ranks at once).
         secrets: Modal secrets for the trainer.
         cpu: CPU cores per node (Zephon tokenizes and packs alongside the trainers).
         memory: Memory per node, in MiB.
@@ -58,15 +69,18 @@ class ElasticJob:
     name: str
     image: modal.Image
     adapter: Adapter
-    lanes: int
+    canonical_replicas: int
     placements: Sequence[Placement]
-    runs_volume: str
+    runs_volume: modal.Volume
     volumes: Mapping[str, modal.Volume] = field(default_factory=dict)
-    compile_cache_volume: str | None = None
+    compile_cache_volume: modal.Volume | None = None
     secrets: Sequence[modal.Secret] = ()
     cpu: float = 32.0
     memory: int = 256 * 1024
     timeout: int = 2 * 60 * 60
+    app: modal.App = field(init=False)
+    _functions: dict[str, Any] = field(init=False, repr=False)
+    _compare: Any = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.placements:
@@ -74,26 +88,27 @@ class ElasticJob:
         names = [placement.name for placement in self.placements]
         if len(set(names)) != len(names):
             raise ValueError(f"Placement names must be unique, got {names}")
+        _volume_name(self.runs_volume)
+        if self.compile_cache_volume is not None:
+            _volume_name(self.compile_cache_volume)
         for placement in self.placements:
-            placement.check_lanes(self.lanes, self.adapter.model_parallel_size)
-        self.app = modal.App(self.name)
-        self._functions = {placement.name: self._register(placement) for placement in self.placements}
-        self._compare = self.app.function(
+            placement.check_canonical_replicas(self.canonical_replicas, self.adapter.model_parallel_size)
+        # Frozen, so derived state goes in through object.__setattr__.
+        object.__setattr__(self, "placements", tuple(self.placements))
+        object.__setattr__(self, "app", modal.App(self.name))
+        functions = {placement.name: self._register(placement) for placement in self.placements}
+        object.__setattr__(self, "_functions", functions)
+        compare = self.app.function(
             name="compare",
             image=modal.Image.debian_slim(python_version="3.12").add_local_python_source("zephon_modal"),
-            volumes={RUNS_MOUNT: self._runs_volume()},
+            volumes={RUNS_MOUNT: self.runs_volume},
         )(runner.compare)
-
-    def _runs_volume(self) -> modal.Volume:
-        return modal.Volume.from_name(self.runs_volume, create_if_missing=True, version=2)
+        object.__setattr__(self, "_compare", compare)
 
     def _register(self, placement: Placement) -> Any:
-        volumes: dict[Any, Any] = {RUNS_MOUNT: self._runs_volume(), **self.volumes}
+        volumes: dict[Any, Any] = {RUNS_MOUNT: self.runs_volume, **self.volumes}
         if self.compile_cache_volume is not None:
-            # Inductor writes cache entries via rename from many ranks at once.
-            volumes[COMPILE_CACHE_MOUNT] = modal.Volume.from_name(
-                self.compile_cache_volume, create_if_missing=True, version=2
-            )
+            volumes[COMPILE_CACHE_MOUNT] = self.compile_cache_volume
         target: Any = runner.train_node
         if placement.nodes > 1:
             target = modal.clustered(size=placement.nodes, rdma=True)(target)
@@ -128,13 +143,14 @@ class ElasticJob:
             run_id=run_id,
             steps=steps,
             seed=seed,
+            canonical_replicas=self.canonical_replicas,
             launch_id=new_launch_id(),
             placement=placement,
             adapter=self.adapter,
             runs_mount=RUNS_MOUNT,
-            runs_volume=self.runs_volume,
+            runs_volume_name=_volume_name(self.runs_volume),
             compile_cache_mount=COMPILE_CACHE_MOUNT if self.compile_cache_volume else None,
-            compile_cache_volume=self.compile_cache_volume,
+            compile_cache_volume_name=_volume_name(self.compile_cache_volume) if self.compile_cache_volume else None,
         )
 
     def launch(
@@ -152,4 +168,4 @@ class ElasticJob:
     def compare(self, reference: str, candidate: str) -> list[dict]:
         """Compare two runs' per-step sample hashes."""
         with self.app.run():
-            return self._compare.remote(RUNS_MOUNT, self.runs_volume, reference, candidate)
+            return self._compare.remote(RUNS_MOUNT, _volume_name(self.runs_volume), reference, candidate)

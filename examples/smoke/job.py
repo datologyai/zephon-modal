@@ -43,9 +43,11 @@ job = ElasticJob(
     name="zephon-modal-smoke",
     image=image,
     adapter=FakeTrainer(),
-    lanes=4,
+    canonical_replicas=4,
     placements=[Placement("T4:2"), Placement("T4")],
-    runs_volume=os.environ.get("ZEPHON_MODAL_SMOKE_VOLUME", "zephon-modal-smoke-runs"),
+    runs_volume=modal.Volume.from_name(
+        os.environ.get("ZEPHON_MODAL_SMOKE_VOLUME", "zephon-modal-smoke-runs"), create_if_missing=True, version=2
+    ),
     cpu=2.0,
     memory=4096,
     timeout=10 * 60,

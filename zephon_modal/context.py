@@ -28,6 +28,9 @@ class LaunchContext:
         run_dir: Checkpoints, sample hashes and launch records live here.
         steps: Total optimizer steps to reach, not steps to add.
         seed: Zephon seed. Changing it mid-run changes the data.
+        canonical_replicas: Zephon's ``canonical_replicas`` for the run;
+            recipes should pass this to Zephon rather than keep their own
+            copy, and consume whole lane windows per optimizer step.
         launch_id: Sortable UTC timestamp identifying this launch.
         placement: Name of the placement this launch runs on.
         nnodes: Nodes in this launch.
@@ -44,6 +47,7 @@ class LaunchContext:
     run_dir: str
     steps: int
     seed: int
+    canonical_replicas: int
     launch_id: str
     placement: str
     nnodes: int

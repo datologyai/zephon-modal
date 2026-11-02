@@ -38,13 +38,14 @@ class RunSpec:
     run_id: str
     steps: int
     seed: int
+    canonical_replicas: int
     launch_id: str
     placement: Placement
     adapter: Adapter
     runs_mount: str
-    runs_volume: str
+    runs_volume_name: str
     compile_cache_mount: str | None = None
-    compile_cache_volume: str | None = None
+    compile_cache_volume_name: str | None = None
 
     @property
     def run_dir(self) -> str:
@@ -78,6 +79,7 @@ def launch_context(spec: RunSpec, topology: NodeTopology) -> LaunchContext:
         run_dir=spec.run_dir,
         steps=spec.steps,
         seed=spec.seed,
+        canonical_replicas=spec.canonical_replicas,
         launch_id=spec.launch_id,
         placement=spec.placement.name,
         nnodes=topology.nnodes,
@@ -143,6 +145,7 @@ def _record_launch(spec: RunSpec, ctx: LaunchContext) -> None:
         "dp": spec.placement.dp_size(spec.adapter.model_parallel_size),
         "steps": spec.steps,
         "seed": spec.seed,
+        "canonical_replicas": spec.canonical_replicas,
     }
     with open(f"{launches_dir}/{spec.launch_id}.json", "w") as launch_file:
         json.dump(record, launch_file, indent=2)
@@ -175,9 +178,9 @@ def finish_launch(spec: RunSpec) -> list[str]:
 
     if os.path.isdir(LOCAL_SAMPLE_HASH_DIR):
         shutil.copytree(LOCAL_SAMPLE_HASH_DIR, f"{spec.run_dir}/{SAMPLE_HASH_SUBDIR}", dirs_exist_ok=True)
-    modal.Volume.from_name(spec.runs_volume).commit()
-    if spec.compile_cache_volume is not None:
-        modal.Volume.from_name(spec.compile_cache_volume).commit()
+    modal.Volume.from_name(spec.runs_volume_name).commit()
+    if spec.compile_cache_volume_name is not None:
+        modal.Volume.from_name(spec.compile_cache_volume_name).commit()
     checkpoint_dir = f"{spec.run_dir}/{CHECKPOINT_SUBDIR}"
     return sorted(os.listdir(checkpoint_dir)) if os.path.isdir(checkpoint_dir) else []
 
@@ -193,11 +196,11 @@ def train_node(spec: RunSpec) -> list[str]:
     return checkpoints
 
 
-def compare(runs_mount: str, runs_volume: str, reference: str, candidate: str) -> list[dict]:
+def compare(runs_mount: str, runs_volume_name: str, reference: str, candidate: str) -> list[dict]:
     """Compare two runs' sample hashes on the runs Volume."""
     import modal
 
     from zephon_modal.verify.compare import compare_runs
 
-    modal.Volume.from_name(runs_volume).reload()
+    modal.Volume.from_name(runs_volume_name).reload()
     return compare_runs(f"{runs_mount}/{reference}", f"{runs_mount}/{candidate}")

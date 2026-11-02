@@ -46,7 +46,7 @@ def _placements(args: argparse.Namespace) -> None:
         flags = " nonpreemptible" if placement.nonpreemptible else ""
         print(
             f"{index}  {placement.name:<16} {placement.nodes} x {placement.gpu:<8} "
-            f"world {placement.world_size:>3}  dp {dp:>3}  lanes/rank {job.lanes // dp}{flags}"
+            f"world {placement.world_size:>3}  dp {dp:>3}  lanes/rank {job.canonical_replicas // dp}{flags}"
         )
 
 
