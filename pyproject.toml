@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zephon-modal"
+description = "Elastic, deterministic Zephon training runs on Modal"
+authors = [{name = "Datology Team", email = "zephon@datologyai.com"}]
+license = {text = "Apache-2.0"}
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["pytorch", "modal", "distributed-training", "zephon"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+
+# Only what the local client needs. The training image brings Zephon (>=0.2.1,
+# for aggregate_store), torch and the training framework.
+dependencies = [
+    "modal>=1.6.1",
+]
+
+# No console script yet: `python -m zephon_modal` is the entry point until the
+# `zephon` CLI harness ships, and then this registers `zephon modal` with it.
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.15.0",
+    "pyright>=1.1.0",
+    "pre-commit>=3.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["zephon_modal*"]
+
+[tool.setuptools.package-data]
+zephon_modal = ["py.typed"]
+
+[tool.setuptools_scm]
+write_to = "zephon_modal/_version.py"
+# Tags carry a prefix so they won't clash with zephon's own `v*` tags if this
+# package later moves into the zephon repo.
+tag_regex = "^zephon-modal-v(?P<version>[0-9][^+]*)$"
+fallback_version = "0.0.0"
+
+[tool.setuptools_scm.scm.git]
+describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "zephon-modal-v*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+exclude = ["zephon_modal/_version.py"]
+
+[tool.ruff.lint]
+select = ["C4", "D", "I", "LOG", "PERF", "PLE", "UP006", "F401"]
+ignore = ["C408", "D102", "D105", "D107", "D203", "D212", "D213", "D401", "D404", "D417", "E501"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["zephon_modal"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+include = ["zephon_modal/**"]
+# Modules that only run inside the training image, where torch, torchtitan
+# and Megatron are installed.
+reportMissingImports = "none"

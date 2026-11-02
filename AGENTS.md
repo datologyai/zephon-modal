@@ -1,0 +1,17 @@
+# Agent notes
+
+Start with README.md: concepts, commands, smoke test and roadmap.
+
+- `make`-free for now: `uv sync --group dev`, then `uv run pytest`,
+  `uv run ruff format . && uv run ruff check .`, `uv run pyright`.
+- Match zephon's conventions (Apache-2.0 SPDX headers, Google docstrings,
+  ruff/pyright settings) so this package can move into the zephon repo later.
+- Use only Zephon's public API, never `zephon._internal`. Needing an internal
+  means Zephon needs a public API for it.
+- Keep Datology-specific names (Modal workspace, Volume names, recipes) out
+  of this repo; they live in zephon-modal-demo.
+- Modal runs cost money and the workspace is shared: prefix run IDs and
+  Volume names with your name, and prefer `examples/smoke` (T4s) over GPU
+  recipes while iterating.
+- Modules under `zephon_modal/adapters/*_loader.py` and `*_entry.py` only
+  import inside training images (torch, torchtitan, Megatron).
