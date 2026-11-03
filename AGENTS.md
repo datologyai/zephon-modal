@@ -13,5 +13,7 @@ Start with README.md: concepts, commands, smoke test and roadmap.
 - Modal runs cost money and the workspace is shared: prefix run IDs and
   Volume names with your name, and prefer `examples/smoke` (T4s) over GPU
   recipes while iterating.
-- Modules under `zephon_modal/adapters/*_loader.py` and `*_entry.py` only
-  import inside training images (torch, torchtitan, Megatron).
+- `zephon_modal/zephon/torchtitan.py` and `megatron_entry.py` only import
+  inside training images (torch, torchtitan, Megatron). The rest of the
+  package must import without torch; `checkpoints.py` imports it lazily
+  (it's a dev dependency for the tests).

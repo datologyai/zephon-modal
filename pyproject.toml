@@ -35,6 +35,8 @@ dev = [
     "ruff>=0.15.0",
     "pyright>=1.1.0",
     "pre-commit>=3.0.0",
+    # Checkpoint tests write real DCP checkpoints; containers bring their own torch.
+    "torch>=2.6",
 ]
 
 [tool.setuptools.packages.find]

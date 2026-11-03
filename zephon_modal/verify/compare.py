@@ -28,6 +28,8 @@ def load_step_digests(sample_hash_dir: str) -> dict[int, dict[str, Any]]:
 
     A step re-trained after a resume appears in several launches; launch IDs
     sort chronologically, so the latest launch's record is the one that counts.
+    Within one file, the last record for a step wins: a restarted attempt of
+    the same launch appends to the file the earlier attempt left.
     """
     per_step: dict[int, dict[str, Any]] = {}
     for name in sorted(os.listdir(sample_hash_dir)):
@@ -37,17 +39,18 @@ def load_step_digests(sample_hash_dir: str) -> dict[int, dict[str, Any]]:
                 record = json.loads(line)
                 entry = per_step.get(record["step"])
                 if entry is None or entry["launch_id"] < launch_id:
-                    entry = per_step[record["step"]] = {"launch_id": launch_id, "dp": record["dp"], "rows": []}
+                    entry = per_step[record["step"]] = {"launch_id": launch_id, "dp": record["dp"], "rows_by_file": {}}
                 if entry["launch_id"] == launch_id:
-                    entry["rows"].extend(record["row_hashes"])
-    return {
-        step: {
-            "digest": hashlib.sha256("".join(sorted(entry["rows"])).encode()).hexdigest()[:16],
-            "rows": len(entry["rows"]),
+                    entry["rows_by_file"][name] = record["row_hashes"]
+    digests = {}
+    for step, entry in sorted(per_step.items()):
+        rows = [row for file_rows in entry["rows_by_file"].values() for row in file_rows]
+        digests[step] = {
+            "digest": hashlib.sha256("".join(sorted(rows)).encode()).hexdigest()[:16],
+            "rows": len(rows),
             "dp": entry["dp"],
         }
-        for step, entry in sorted(per_step.items())
-    }
+    return digests
 
 
 def compare_runs(reference_dir: str, candidate_dir: str) -> list[dict[str, Any]]:

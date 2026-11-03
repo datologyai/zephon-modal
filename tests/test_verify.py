@@ -78,3 +78,16 @@ def test_disjoint_runs_are_not_identical(tmp_path):
     _train(tmp_path / "ref", "20261102T000000", dp=2, steps=range(2))
     _train(tmp_path / "cand", "20261102T000000", dp=2, steps=range(2, 4))
     assert not identical(compare_runs(str(tmp_path / "ref"), str(tmp_path / "cand")))
+
+
+def test_restarted_attempt_appends_and_its_records_win(tmp_path):
+    _train(tmp_path / "ref", "20261102T000000", dp=2, steps=range(8))
+    # Attempt 1 trains steps 0-6, is stopped, and its checkpoint is at step 5.
+    # Attempt 2 of the same launch appends steps 5-8 to the same files; the
+    # stale step-6 record before it must not double-count.
+    _train(tmp_path / "cand", "20261102T010000", dp=2, steps=range(6))
+    _train(tmp_path / "cand", "20261102T010000", dp=2, steps=range(5, 6), microbatch_order=lambda mbs: mbs[:4] * 2)
+    _train(tmp_path / "cand", "20261102T010000", dp=2, steps=range(5, 8))
+    rows = compare_runs(str(tmp_path / "ref"), str(tmp_path / "cand"))
+    assert [row["status"] for row in rows] == [MATCH] * 8
+    assert {row["rows"] for row in rows} == {16}

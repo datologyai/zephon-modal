@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from zephon_modal.adapters.base import Adapter
+from zephon_modal.checkpoints import CheckpointLayout
 from zephon_modal.context import LaunchContext
 
 
@@ -23,11 +24,15 @@ class Torchtitan(Adapter):
         module: Recipe module, passed as ``--module``.
         config: Recipe function in that module, passed as ``--config``.
         torchtitan_dir: torchtitan-zephon checkout in the image.
+
+    A stopped torchtitan run exits without saving and resumes from its last
+    periodic checkpoint.
     """
 
     module: str
     config: str
     torchtitan_dir: str = "/opt/torchtitan"
+    checkpoints: CheckpointLayout | None = CheckpointLayout(subdir="checkpoint", step_pattern=r"step-(\d+)")
 
     def workdir(self) -> str:
         return self.torchtitan_dir

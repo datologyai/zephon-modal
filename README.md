@@ -6,10 +6,10 @@ the physical shapes it may run on. Any launch of a run can land on any of
 those shapes, resume from the latest checkpoint, and still train on exactly
 the same samples at every step. `compare` checks that.
 
-**Status: early, private.** Launches are manual (you pick the
-placement). The supervisor that moves a run between placements on its own,
-checkpoint handling that survives preemption, and `tune` come next (see
-[Roadmap](#roadmap)).
+**Status: early, private.** Launches are manual (you pick the placement),
+and a launch survives Modal stopping its container (see
+[Preemption](#preemption)). The supervisor that moves a run between
+placements on its own and `tune` come next (see [Roadmap](#roadmap)).
 
 ## How it fits together
 
@@ -89,6 +89,39 @@ uv run python -m zephon_modal compare path/to/job.py --reference <ref-run> --can
 it. Use `--detach` for anything long: without it, Modal stops the app if this
 client disconnects.
 
+## Preemption
+
+When Modal preempts a container (or you run `modal container stop`), it
+sends SIGINT to the function's process group, kills the container 30
+seconds later, and restarts the same input on a new container. zephon-modal
+makes that restart a clean resume:
+
+- **The runner, not each rank, decides how the trainer stops.** torchrun runs
+  in its own session, so Modal's SIGINT reaches only the runner. It sends
+  torchrun the adapter's `shutdown_signal` (SIGTERM), which forwards it to
+  every rank, waits up to `shutdown_timeout` (10 s), then kills the trainer
+  and commits the Volume.
+- **The steps hashed so far survive.** Each node syncs its hash files to the
+  run directory every 30 s and again when stopped, so Modal's background
+  commits keep them even if the final commit doesn't finish. A restarted
+  attempt keeps its launch ID; it restores its node's files and appends, and
+  `compare` keeps a file's last record for each step.
+- **Incomplete checkpoints are set aside before a resume.** A checkpoint
+  counts only if every shard its DCP `.metadata` lists is present at full
+  length, which also catches another node's shards that never got
+  committed. Node 0 moves the rest to `discarded-checkpoints/` (and points
+  Megatron's tracker file at the latest good one) before torchrun starts.
+- **Every attempt is recorded** in `launches/<launch_id>/`: `launch.json` for
+  what was asked, one `<task_id>.json` per container and attempt for how it
+  went (`outcome` completed, failed or stopped; the checkpoint it resumed
+  from; any it set aside; the latest at the end).
+
+A stopped run loses the steps since its last periodic checkpoint. Saving on
+the way out (`Megatron(checkpoint_on_shutdown=True)`, which adds
+`--exit-signal-handler`) only helps for small checkpoints: the save and its
+commit must fit in Modal's 30 s, and Qwen3-0.6B with optimizer state (~8 GB)
+took 37 s to save on 4 H100s.
+
 ## Smoke test
 
 `examples/smoke` exercises launch, resume and compare with a fake trainer on
@@ -108,13 +141,26 @@ Expected: the second launch resumes at step 5 on one GPU, and `compare`
 reports 10/10 steps identical. Running with `--seed 43` gives 0/10 and exit
 status 1.
 
+To rehearse a preemption, use the `preempt` job (3 s per step), and stop its
+container mid-run from another terminal:
+
+```bash
+uv run python -m zephon_modal launch examples/smoke/job.py:job --run-id <you>-smoke-ref --steps 40 --placement t4x2
+uv run python -m zephon_modal launch examples/smoke/job.py:preempt --run-id <you>-preempt --steps 40 --placement t4x2
+modal container list    # find the zephon-modal-smoke-preempt container, then after ~30 s:
+modal container stop <container-id>
+uv run python -m zephon_modal compare examples/smoke/job.py --reference <you>-smoke-ref --candidate <you>-preempt
+```
+
+Expected: the launch restarts on a new container, resumes from step 5 or 10,
+finishes, and `compare` reports 40/40 identical. `preempt_save` does the same
+but saves on the way out, so it resumes from the step it was stopped at.
+
 ## Roadmap
 
-1. **Checkpoints that survive preemption:** completion markers, a commit on
-   SIGTERM, and safe cleanup of old checkpoints on clusters.
-2. **Supervisor:** walk the placement list, relaunch on preemption or
+1. **Supervisor:** walk the placement list, relaunch on preemption or
    timeout, and keep its own state on the runs Volume so it can be restarted.
-3. **`tune` / `profile`:** search Zephon worker settings per placement on CPU
+2. **`tune` / `profile`:** search Zephon worker settings per placement on CPU
    containers, then save a profile that `launch` uses.
-4. **`zephon modal ...`:** once the `zephon` CLI harness ships, register this
+3. **`zephon modal ...`:** once the `zephon` CLI harness ships, register this
    package as its `modal` subcommand.
