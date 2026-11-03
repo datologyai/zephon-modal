@@ -43,10 +43,10 @@ def _placements(args: argparse.Namespace) -> None:
     job = load_job(args.job)
     for index, placement in enumerate(job.placements):
         dp = placement.dp_size(job.adapter.model_parallel_size)
-        flags = " nonpreemptible" if placement.nonpreemptible else ""
+        note = job.data.describe_dp_size(dp)
         print(
             f"{index}  {placement.name:<16} {placement.nodes} x {placement.gpu:<8} "
-            f"world {placement.world_size:>3}  dp {dp:>3}  lanes/rank {job.canonical_replicas // dp}{flags}"
+            f"world {placement.world_size:>3}  dp {dp:>3}" + (f"  {note}" if note else "")
         )
 
 

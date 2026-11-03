@@ -17,7 +17,7 @@ class Torchtitan(Adapter):
 
     The recipe module must be importable in the training image. It reads the
     launch from :func:`zephon_modal.context`, and can log sample hashes with
-    :class:`zephon_modal.adapters.torchtitan_loader.SampleHashingZephonDataLoader`.
+    :class:`zephon_modal.zephon.torchtitan.SampleHashingZephonDataLoader`.
 
     Attributes:
         module: Recipe module, passed as ``--module``.

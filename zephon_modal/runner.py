@@ -20,13 +20,11 @@ from dataclasses import asdict, dataclass
 
 from zephon_modal.adapters.base import Adapter
 from zephon_modal.context import LaunchContext
+from zephon_modal.data import DataContract
 from zephon_modal.placement import Placement
 from zephon_modal.verify.hashes import SAMPLE_HASH_SUBDIR
 
 RENDEZVOUS_PORT = 29500
-# Zephon merges lane state through torchrun's own TCPStore on every launch,
-# single- or multi-node (see LaunchContext.aggregate_store).
-AGGREGATE_STORE = "torch://"
 # Hash files are written per step; they live on local disk and are copied to
 # the run directory when the launch ends.
 LOCAL_SAMPLE_HASH_DIR = "/tmp/zephon-modal/sample-hashes"
@@ -41,10 +39,10 @@ class RunSpec:
     run_id: str
     steps: int
     seed: int
-    canonical_replicas: int
     launch_id: str
     placement: Placement
     adapter: Adapter
+    data: DataContract
     runs_mount: str
     runs_volume_name: str
     compile_cache_mount: str | None = None
@@ -81,14 +79,13 @@ def launch_context(spec: RunSpec, topology: NodeTopology) -> LaunchContext:
         run_dir=spec.run_dir,
         steps=spec.steps,
         seed=spec.seed,
-        canonical_replicas=spec.canonical_replicas,
         launch_id=spec.launch_id,
         placement=spec.placement.name,
         nnodes=topology.nnodes,
         node_rank=topology.node_rank,
         nproc_per_node=spec.placement.gpus_per_node,
         sample_hash_dir=LOCAL_SAMPLE_HASH_DIR,
-        aggregate_store=AGGREGATE_STORE,
+        data=spec.data.context(),
     )
 
 
@@ -143,7 +140,7 @@ def _record_launch(spec: RunSpec, ctx: LaunchContext) -> None:
         "dp": spec.placement.dp_size(spec.adapter.model_parallel_size),
         "steps": spec.steps,
         "seed": spec.seed,
-        "canonical_replicas": spec.canonical_replicas,
+        "data": {"contract": type(spec.data).__qualname__, **spec.data.context()},
     }
     with open(f"{launches_dir}/{spec.launch_id}.json", "w") as launch_file:
         json.dump(record, launch_file, indent=2)

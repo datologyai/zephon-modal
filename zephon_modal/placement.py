@@ -1,7 +1,7 @@
 # Copyright 2026 DatologyAI
 # SPDX-License-Identifier: Apache-2.0
 
-"""Physical shapes a run can train on, and which of them a run's canonical replicas allow."""
+"""Physical shapes a run can train on."""
 
 from __future__ import annotations
 
@@ -14,17 +14,18 @@ GPUS_PER_FULL_NODE = 8
 
 @dataclass(frozen=True)
 class Placement:
-    """One physical shape: a GPU spec per node, a node count, and preemption tolerance.
+    """One physical shape: a GPU spec per node and a node count.
+
+    There's no preemption setting: Modal doesn't offer non-preemptible GPU
+    Functions, so placements differ in availability, not preemptibility.
 
     Attributes:
         gpu: Modal GPU spec for each node, e.g. ``"H100:8"``.
         nodes: Number of nodes; more than one runs as a ``@modal.clustered`` function.
-        nonpreemptible: Ask Modal for non-preemptible capacity.
     """
 
     gpu: str
     nodes: int = 1
-    nonpreemptible: bool = False
 
     def __post_init__(self) -> None:
         if self.nodes < 1:
@@ -52,8 +53,6 @@ class Placement:
         name = f"{slug}x{self.gpus_per_node}"
         if self.nodes > 1:
             name = f"{self.nodes}x{name}"
-        if self.nonpreemptible:
-            name += "-np"
         return name
 
     def dp_size(self, model_parallel_size: int = 1) -> int:
@@ -65,12 +64,3 @@ class Placement:
                 f"model_parallel_size={model_parallel_size}"
             )
         return dp
-
-    def check_canonical_replicas(self, canonical_replicas: int, model_parallel_size: int = 1) -> None:
-        """Raise unless this placement's DP degree divides the run's Zephon lane count."""
-        dp = self.dp_size(model_parallel_size)
-        if canonical_replicas % dp:
-            raise ValueError(
-                f"Placement {self.name} gives DP={dp}, which doesn't divide canonical_replicas={canonical_replicas}; "
-                "Zephon can only train and resume on DP degrees that divide it"
-            )

@@ -14,6 +14,7 @@ import modal
 
 from zephon_modal import runner
 from zephon_modal.adapters.base import Adapter
+from zephon_modal.data import DataContract
 from zephon_modal.placement import Placement
 
 RUNS_MOUNT = "/runs"
@@ -35,7 +36,7 @@ def _volume_name(volume: modal.Volume) -> str:
     return volume.name
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, kw_only=True)
 class ElasticJob:
     """A training recipe that can run, and resume, on any of several placements.
 
@@ -49,14 +50,14 @@ class ElasticJob:
         image: Training image. It needs the framework, Zephon >= 0.2.1 and
             the recipe modules; ``zephon_modal`` itself is added here.
         adapter: How to launch the framework's trainer.
-        canonical_replicas: Zephon's ``canonical_replicas`` (the run's lanes).
-            Every placement's DP degree must divide it, and the recipe must
-            consume whole lane windows per step.
         placements: Physical shapes, in order of preference.
         runs_volume: Volume holding runs, mounted at ``/runs``. Use a named v2
             Volume (``modal.Volume.from_name(..., version=2)``): every rank
             writes its own checkpoint shard, and containers commit it by name.
         volumes: Extra mounts, e.g. training data.
+        data: The data loader's contract: which DP degrees it allows and
+            what settings trainers see. Use :class:`zephon_modal.zephon.Zephon`
+            for Zephon runs; the default allows any DP degree.
         compile_cache_volume: Optional named v2 Volume for torch.compile
             caches, which every relaunch would otherwise rebuild (Inductor
             writes cache entries via rename from many ranks at once).
@@ -69,9 +70,9 @@ class ElasticJob:
     name: str
     image: modal.Image
     adapter: Adapter
-    canonical_replicas: int
     placements: Sequence[Placement]
     runs_volume: modal.Volume
+    data: DataContract = DataContract()
     volumes: Mapping[str, modal.Volume] = field(default_factory=dict)
     compile_cache_volume: modal.Volume | None = None
     secrets: Sequence[modal.Secret] = ()
@@ -92,7 +93,11 @@ class ElasticJob:
         if self.compile_cache_volume is not None:
             _volume_name(self.compile_cache_volume)
         for placement in self.placements:
-            placement.check_canonical_replicas(self.canonical_replicas, self.adapter.model_parallel_size)
+            dp = placement.dp_size(self.adapter.model_parallel_size)
+            try:
+                self.data.check_dp_size(dp)
+            except ValueError as error:
+                raise ValueError(f"Placement {placement.name} gives DP={dp}: {error}") from error
         # Frozen, so derived state goes in through object.__setattr__.
         object.__setattr__(self, "placements", tuple(self.placements))
         object.__setattr__(self, "app", modal.App(self.name))
@@ -121,7 +126,6 @@ class ElasticJob:
             timeout=self.timeout,
             volumes=volumes,
             secrets=list(self.secrets),
-            nonpreemptible=placement.nonpreemptible,
         )(target)
 
     @property
@@ -143,7 +147,7 @@ class ElasticJob:
             run_id=run_id,
             steps=steps,
             seed=seed,
-            canonical_replicas=self.canonical_replicas,
+            data=self.data,
             launch_id=new_launch_id(),
             placement=placement,
             adapter=self.adapter,

@@ -5,7 +5,10 @@
 
 Run under torchrun with the Megatron checkout as the working directory::
 
-    torchrun ... -m zephon_modal.adapters.megatron_entry pretrain_gpt_zephon.py <script args>
+    torchrun ... -m zephon_modal.zephon.megatron_entry pretrain_gpt_zephon.py <script args>
+
+which is what ``Megatron(entry="zephon_modal.zephon.megatron_entry",
+script="pretrain_gpt_zephon.py", ...)`` runs.
 
 It wraps the Zephon dataset provider so every DP rank logs a hash of each
 packed sequence it trains on, in the same format as the torchtitan loader,

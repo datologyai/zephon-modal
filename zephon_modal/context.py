@@ -14,7 +14,8 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 CONTEXT_ENV = "ZEPHON_MODAL_CONTEXT"
 
@@ -27,10 +28,7 @@ class LaunchContext:
         run_id: The run; every launch of it shares ``run_dir``.
         run_dir: Checkpoints, sample hashes and launch records live here.
         steps: Total optimizer steps to reach, not steps to add.
-        seed: Zephon seed. Changing it mid-run changes the data.
-        canonical_replicas: Zephon's ``canonical_replicas`` for the run;
-            recipes should pass this to Zephon rather than keep their own
-            copy, and consume whole lane windows per optimizer step.
+        seed: Data seed. Changing it mid-run changes the data.
         launch_id: Sortable UTC timestamp identifying this launch.
         placement: Name of the placement this launch runs on.
         nnodes: Nodes in this launch.
@@ -38,25 +36,21 @@ class LaunchContext:
         nproc_per_node: Trainer processes (GPUs) per node.
         sample_hash_dir: Node-local directory for per-step sample hashes,
             copied into ``run_dir`` when the launch ends.
-        aggregate_store: Zephon ``aggregate_store``: always ``"torch://"``,
-            torchrun's own c10d TCPStore. Modal Volume writes only reach other
-            containers after commit + reload, so a shared ``aggregate_dir``
-            can't work across nodes, and on one node it adds nothing (restore
-            reads the merged lane state from the trainer's checkpoint).
+        data: Settings from the job's :class:`~zephon_modal.data.DataContract`
+            (for Zephon, read them with :func:`zephon_modal.zephon.settings`).
     """
 
     run_id: str
     run_dir: str
     steps: int
     seed: int
-    canonical_replicas: int
     launch_id: str
     placement: str
     nnodes: int
     node_rank: int
     nproc_per_node: int
     sample_hash_dir: str
-    aggregate_store: str
+    data: dict[str, Any] = field(default_factory=dict)
 
     @property
     def world_size(self) -> int:

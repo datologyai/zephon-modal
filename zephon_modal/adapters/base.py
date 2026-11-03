@@ -27,8 +27,7 @@ class Adapter:
 
     Attributes:
         model_parallel_size: TP x PP x CP. DP is the world size divided by
-            this, and every placement's DP must divide the run's
-            ``canonical_replicas``.
+            this, and the job's data contract decides which DP degrees work.
     """
 
     model_parallel_size: int = 1
