@@ -27,9 +27,11 @@ checkpoint handling that survives preemption, and `tune` come next (see
   Adapters are plain data. Recipe-specific code is named by import string and
   runs inside the container.
 - **Recipes read the launch from `zephon_modal.context()`**: run directory,
-  step target, seed, launch ID, and the Zephon `aggregate_store` /
-  `aggregate_dir` (multi-node launches use torchrun's TCPStore, single-node
-  launches a directory on the runs Volume).
+  step target, seed, launch ID, `canonical_replicas`, and the Zephon
+  `aggregate_store`. That is always `torch://` (torchrun's own TCPStore):
+  Volume writes don't reach other containers until commit + reload, so a
+  shared `aggregate_dir` can't work across nodes, and restore reads the
+  merged lane state from the trainer's checkpoint anyway.
 - **Sample hashes:** each DP rank logs a hash of every packed sequence per
   step. `compare` treats each step as a multiset, so runs on different GPU
   counts match when they trained on the same data.
@@ -54,7 +56,7 @@ job = ElasticJob(
 
 In the torchtitan recipe, use `SampleHashingZephonDataLoader.Config` from
 `zephon_modal.adapters.torchtitan_loader` with `microbatches_per_step`, and
-take `run_id`, `aggregate_store` / `aggregate_dir`, the step target and
+take `run_id`, `aggregate_store`, `canonical_replicas`, the step target and
 `keep_all_checkpoints` from `zephon_modal.context()`. For Megatron, pass
 `Megatron(args="my_recipes:pretrain_args")`, where `pretrain_args(ctx)`
 returns `pretrain_gpt_zephon.py`'s arguments.

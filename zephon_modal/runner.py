@@ -24,6 +24,9 @@ from zephon_modal.placement import Placement
 from zephon_modal.verify.hashes import SAMPLE_HASH_SUBDIR
 
 RENDEZVOUS_PORT = 29500
+# Zephon merges lane state through torchrun's own TCPStore on every launch,
+# single- or multi-node (see LaunchContext.aggregate_store).
+AGGREGATE_STORE = "torch://"
 # Hash files are written per step; they live on local disk and are copied to
 # the run directory when the launch ends.
 LOCAL_SAMPLE_HASH_DIR = "/tmp/zephon-modal/sample-hashes"
@@ -73,7 +76,6 @@ class NodeTopology:
 
 def launch_context(spec: RunSpec, topology: NodeTopology) -> LaunchContext:
     """The context this node's trainer processes see."""
-    multi_node = topology.nnodes > 1
     return LaunchContext(
         run_id=spec.run_id,
         run_dir=spec.run_dir,
@@ -86,11 +88,7 @@ def launch_context(spec: RunSpec, topology: NodeTopology) -> LaunchContext:
         node_rank=topology.node_rank,
         nproc_per_node=spec.placement.gpus_per_node,
         sample_hash_dir=LOCAL_SAMPLE_HASH_DIR,
-        # Volume writes only reach other containers after commit + reload, so
-        # multi-node launches merge Zephon lane state through torchrun's own
-        # TCPStore instead of files.
-        aggregate_store="torch://" if multi_node else None,
-        aggregate_dir=None if multi_node else f"{spec.run_dir}/zephon-aggregate",
+        aggregate_store=AGGREGATE_STORE,
     )
 
 

@@ -20,9 +20,8 @@ class Megatron(Adapter):
             called with the :class:`LaunchContext` inside the container and
             returns the script's arguments (it may also write files they
             name, such as a Zephon TOML data recipe). Everything but
-            ``--train-iters`` must stay fixed across resumes, and the Zephon
-            aggregation flag should follow ``ctx.aggregate_store`` /
-            ``ctx.aggregate_dir``.
+            ``--train-iters`` must stay fixed across resumes, and
+            ``--zephon-aggregate-store`` should be ``ctx.aggregate_store``.
         script: Pretraining script, relative to ``megatron_dir``.
         megatron_dir: Megatron-LM-zephon checkout in the image.
     """

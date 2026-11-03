@@ -38,9 +38,11 @@ class LaunchContext:
         nproc_per_node: Trainer processes (GPUs) per node.
         sample_hash_dir: Node-local directory for per-step sample hashes,
             copied into ``run_dir`` when the launch ends.
-        aggregate_store: Zephon ``aggregate_store`` for multi-node launches
-            (``"torch://"``); set exactly when ``aggregate_dir`` isn't.
-        aggregate_dir: Zephon ``aggregate_dir`` for single-node launches.
+        aggregate_store: Zephon ``aggregate_store``: always ``"torch://"``,
+            torchrun's own c10d TCPStore. Modal Volume writes only reach other
+            containers after commit + reload, so a shared ``aggregate_dir``
+            can't work across nodes, and on one node it adds nothing (restore
+            reads the merged lane state from the trainer's checkpoint).
     """
 
     run_id: str
@@ -54,8 +56,7 @@ class LaunchContext:
     node_rank: int
     nproc_per_node: int
     sample_hash_dir: str
-    aggregate_store: str | None
-    aggregate_dir: str | None
+    aggregate_store: str
 
     @property
     def world_size(self) -> int:
