@@ -3,6 +3,8 @@
 
 """Entry point for ``python -m zephon_modal``."""
 
+import sys
+
 from zephon_modal.cli import main
 
-main()
+sys.exit(main())

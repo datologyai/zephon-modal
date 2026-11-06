@@ -26,8 +26,11 @@ dependencies = [
     "modal>=1.6.1",
 ]
 
-# No console script yet: `python -m zephon_modal` is the entry point until the
-# `zephon` CLI harness ships, and then this registers `zephon modal` with it.
+# `zephon modal ...` once a zephon with its CLI (on main after v0.2.1) is installed;
+# `python -m zephon_modal ...` works either way. No hard dependency on zephon:
+# the core doesn't need it.
+[project.entry-points."zephon.cli"]
+modal = "zephon_modal.cli:register"
 
 [dependency-groups]
 dev = [

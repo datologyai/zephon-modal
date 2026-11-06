@@ -89,6 +89,11 @@ uv run python -m zephon_modal compare path/to/job.py --reference <ref-run> --can
 it. Use `--detach` for anything long: without it, Modal stops the app if this
 client disconnects.
 
+With Zephon's CLI installed too (on Zephon `main` after v0.2.1), the same
+commands are `zephon modal placements|launch|compare ...`: zephon-modal
+registers itself as a `zephon.cli` plugin. zephon-modal doesn't depend on
+zephon, so `python -m zephon_modal` keeps working without it.
+
 ## Preemption
 
 When Modal preempts a container (or you run `modal container stop`), it
@@ -160,7 +165,5 @@ but saves on the way out, so it resumes from the step it was stopped at.
 
 1. **Supervisor:** walk the placement list, relaunch on preemption or
    timeout, and keep its own state on the runs Volume so it can be restarted.
-2. **`tune` / `profile`:** search Zephon worker settings per placement on CPU
-   containers, then save a profile that `launch` uses.
-3. **`zephon modal ...`:** once the `zephon` CLI harness ships, register this
-   package as its `modal` subcommand.
+2. **`zephon modal tune` / `profile`:** search Zephon worker settings per
+   placement on CPU containers, then save a profile that `launch` uses.
