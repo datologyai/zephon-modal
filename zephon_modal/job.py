@@ -5,28 +5,25 @@
 
 from __future__ import annotations
 
-import time
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import modal
 
-from zephon_modal import runner
+from zephon_modal import runner, supervisor
 from zephon_modal.adapters.base import Adapter
 from zephon_modal.data import DataContract
 from zephon_modal.placement import Placement
+from zephon_modal.runner import new_launch_id
+from zephon_modal.supervisor import SUPERVISOR_FILE, Plan, Policy
 
 RUNS_MOUNT = "/runs"
+# Modal's longest function timeout. A supervisor that hits it leaves its
+# current launch running unsupervised; start another to take over.
+SUPERVISOR_TIMEOUT = 24 * 60 * 60
 COMPILE_CACHE_MOUNT = "/compile-cache"
-
-
-def new_launch_id() -> str:
-    """Sortable, so the latest launch's record wins for a re-trained step.
-
-    Made locally and passed in the spec so every node of a cluster shares it.
-    """
-    return time.strftime("%Y%m%dT%H%M%S", time.gmtime())
 
 
 def _volume_name(volume: modal.Volume) -> str:
@@ -40,9 +37,9 @@ def _volume_name(volume: modal.Volume) -> str:
 class ElasticJob:
     """A training recipe that can run, and resume, on any of several placements.
 
-    Building one registers a Modal function per placement (plus a CPU
-    ``compare`` function) on :attr:`app`, so a job file is also a normal Modal
-    app module. It's frozen: those functions are built from the fields once,
+    Building one registers a Modal function per placement, plus CPU
+    ``supervise`` and ``compare`` functions, on :attr:`app`, so a job file is
+    also a normal Modal app module. It's frozen: those functions are built from the fields once,
     so changing a field afterwards would silently do nothing.
 
     Attributes:
@@ -82,6 +79,7 @@ class ElasticJob:
     app: modal.App = field(init=False)
     _functions: dict[str, Any] = field(init=False, repr=False)
     _compare: Any = field(init=False, repr=False)
+    _supervise: Any = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.placements:
@@ -109,6 +107,19 @@ class ElasticJob:
             volumes={RUNS_MOUNT: self.runs_volume},
         )(runner.compare)
         object.__setattr__(self, "_compare", compare)
+        supervise = self.app.function(
+            name="supervise",
+            # The training image, so specs unpickle with any adapter class the job file defines.
+            image=self.image.add_local_python_source("zephon_modal"),
+            volumes={RUNS_MOUNT: self.runs_volume},
+            secrets=list(self.secrets),
+            cpu=1.0,
+            memory=2048,
+            # Cheap on CPU, and a preempted supervisor would leave its launch unwatched.
+            nonpreemptible=True,
+            timeout=SUPERVISOR_TIMEOUT,
+        )(supervisor.supervise)
+        object.__setattr__(self, "_supervise", supervise)
 
     def _register(self, placement: Placement) -> Any:
         volumes: dict[Any, Any] = {RUNS_MOUNT: self.runs_volume, **self.volumes}
@@ -169,7 +180,68 @@ class ElasticJob:
         with modal.enable_output(), self.app.run(detach=detach):
             return self._functions[chosen.name].remote(spec)
 
+    def supervise(self, run_id: str, steps: int, seed: int = 42, policy: Policy = Policy()) -> str:
+        """Start a detached supervisor that trains ``run_id`` to ``steps`` across placements.
+
+        Returns the supervisor's call ID right away; follow it with
+        :meth:`status`, and stop it with :meth:`cancel`.
+
+        Raises:
+            RuntimeError: if a supervisor, or a launch a supervisor started, is
+                still running for this run.
+        """
+        current = self.status(run_id)
+        if current is not None and current.get("alive"):
+            raise RuntimeError(f"{run_id} already has a running supervisor ({current['supervisor_call_id']})")
+        launch = (current or {}).get("current") or {}
+        if current is not None and _call_running(launch.get("call_id")):
+            # Left behind by a supervisor that timed out: two launches would write the same run.
+            raise RuntimeError(
+                f"{run_id}'s last launch ({launch['call_id']} on {launch['placement']}) is still running"
+            )
+        plan = Plan(
+            run_id=run_id,
+            steps=steps,
+            specs=[self.run_spec(run_id, steps, placement, seed) for placement in self.placements],
+            policy=policy,
+        )
+        with modal.enable_output(), self.app.run(detach=True):
+            call = self._supervise.spawn(plan, dict(self._functions), RUNS_MOUNT, _volume_name(self.runs_volume))
+        return call.object_id
+
+    def status(self, run_id: str) -> dict[str, Any] | None:
+        """The run's supervisor record, plus ``alive``: whether its supervisor is still running.
+
+        ``None`` if the run has never been supervised.
+        """
+        try:
+            content = b"".join(self.runs_volume.read_file(f"{run_id}/{SUPERVISOR_FILE}"))
+        except (FileNotFoundError, modal.exception.NotFoundError):
+            return None
+        record = json.loads(content)
+        return record | {"alive": _call_running(record.get("supervisor_call_id"))}
+
+    def cancel(self, run_id: str) -> bool:
+        """Cancel the run's supervisor, which cancels its launch; returns whether one was running."""
+        current = self.status(run_id)
+        if current is None or not current["alive"]:
+            return False
+        modal.FunctionCall.from_id(current["supervisor_call_id"]).cancel()
+        return True
+
     def compare(self, reference: str, candidate: str) -> list[dict]:
         """Compare two runs' per-step sample hashes."""
         with self.app.run():
             return self._compare.remote(RUNS_MOUNT, _volume_name(self.runs_volume), reference, candidate)
+
+
+def _call_running(call_id: str | None) -> bool:
+    if not call_id:
+        return False
+    try:
+        modal.FunctionCall.from_id(call_id).get(timeout=0)
+    except TimeoutError:
+        return True  # no output yet (builtin TimeoutError; Modal's FunctionTimeoutError means it ended)
+    except Exception:
+        return False
+    return False

@@ -136,6 +136,14 @@ def _compile_cache_env(spec: RunSpec) -> dict[str, str]:
     return {"TORCHINDUCTOR_CACHE_DIR": f"{cache_dir}/inductor", "TRITON_CACHE_DIR": f"{cache_dir}/triton"}
 
 
+def new_launch_id() -> str:
+    """Sortable, so the latest launch's record wins for a re-trained step.
+
+    Made before the launch and passed in its spec, so every node of a cluster shares it.
+    """
+    return time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+
+
 def task_id() -> str:
     """This container's Modal task ID; a restarted input gets a new one."""
     return os.environ.get("MODAL_TASK_ID", "local")
@@ -186,6 +194,22 @@ def record_attempt(spec: RunSpec, ctx: LaunchContext, record: Mapping[str, Any])
     per node.
     """
     _write_json(f"{_launch_dir(spec)}/{task_id()}.json", {"task_id": task_id(), "node_rank": ctx.node_rank, **record})
+
+
+def launch_attempts(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
+    """Node 0's attempt records for one launch, oldest first."""
+    launch_dir = f"{run_dir}/{LAUNCHES_SUBDIR}/{launch_id}"
+    if not os.path.isdir(launch_dir):
+        return []
+    records = []
+    for name in os.listdir(launch_dir):
+        if name == "launch.json" or not name.endswith(".json"):
+            continue
+        with open(f"{launch_dir}/{name}") as record_file:
+            record = json.load(record_file)
+        if record.get("node_rank") == 0:
+            records.append(record)
+    return sorted(records, key=lambda record: record["started"])
 
 
 def prepare_resume(spec: RunSpec, ctx: LaunchContext) -> dict[str, Any]:
@@ -296,6 +320,12 @@ def stop_trainer(trainer: subprocess.Popen, adapter: Adapter) -> int | None:
     return returncode
 
 
+def _commit(volume_name: str) -> None:
+    import modal
+
+    modal.Volume.from_name(volume_name).commit()
+
+
 def finish_launch(spec: RunSpec) -> list[str]:
     """Move sample hashes into the run and commit Volumes; returns the checkpoint steps present.
 
@@ -305,7 +335,7 @@ def finish_launch(spec: RunSpec) -> list[str]:
     import modal
 
     sync_sample_hashes(spec)
-    modal.Volume.from_name(spec.runs_volume_name).commit()
+    _commit(spec.runs_volume_name)
     if spec.compile_cache_volume_name is not None:
         modal.Volume.from_name(spec.compile_cache_volume_name).commit()
     checkpoint_dir = f"{spec.run_dir}/{CHECKPOINT_SUBDIR}"
@@ -315,25 +345,34 @@ def finish_launch(spec: RunSpec) -> list[str]:
 def train_node(spec: RunSpec) -> list[str]:
     """Run one node of a launch; returns the checkpoint steps present afterwards.
 
-    If Modal stops the container (it raises ``KeyboardInterrupt`` here), the
-    trainer is stopped, the Volume committed, and the interrupt re-raised so
-    Modal restarts the input.
+    If Modal stops the container (it raises ``KeyboardInterrupt`` here) or the
+    call is cancelled (``InputCancellation``), the trainer is stopped, the
+    Volume committed, and the exception re-raised: Modal restarts a stopped
+    input, and a cancelled one ends.
     """
+    from modal.exception import InputCancellation
+
     topology = node_topology(spec.placement)
     ctx = launch_context(spec, topology)
     attempt: dict[str, Any] = {"started": _now(), "placement": spec.placement.name, **prepare_resume(spec, ctx)}
+    # Recorded and committed now, so the supervisor sees the launch running
+    # (and a restart as a new task ID) without waiting for it to end.
+    record_attempt(spec, ctx, attempt | {"outcome": "running"})
+    _commit(spec.runs_volume_name)
     trainer = start_trainer(spec, topology)
     syncing_done = threading.Event()
     threading.Thread(target=_sync_sample_hashes_until, args=(spec, syncing_done), daemon=True).start()
     try:
         returncode = trainer.wait()
         attempt |= {"outcome": "completed" if returncode == 0 else "failed", "returncode": returncode}
-    except KeyboardInterrupt:
-        # One stop is enough; ignore any repeat while we clean up.
+    except (KeyboardInterrupt, InputCancellation) as stop:
+        # One stop is enough; ignore any repeat while we clean up (Modal cancels with SIGUSR1).
         signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGUSR1, signal.SIG_IGN)
         # Every step hashed so far, before anything slow: the final commit may not finish.
         sync_sample_hashes(spec)
-        attempt |= {"outcome": "stopped", "returncode": stop_trainer(trainer, spec.adapter)}
+        outcome = "cancelled" if isinstance(stop, InputCancellation) else "stopped"
+        attempt |= {"outcome": outcome, "returncode": stop_trainer(trainer, spec.adapter)}
         raise
     finally:
         syncing_done.set()

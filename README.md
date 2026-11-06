@@ -6,10 +6,10 @@ the physical shapes it may run on. Any launch of a run can land on any of
 those shapes, resume from the latest checkpoint, and still train on exactly
 the same samples at every step. `compare` checks that.
 
-**Status: early, private.** Launches are manual (you pick the placement),
-and a launch survives Modal stopping its container (see
-[Preemption](#preemption)). The supervisor that moves a run between
-placements on its own and `tune` come next (see [Roadmap](#roadmap)).
+**Status: early, private.** `supervise` keeps a run going across placements
+until it reaches its step target (see [Supervisor](#supervisor)), and a
+launch survives Modal stopping its container (see [Preemption](#preemption)).
+`tune` comes next (see [Roadmap](#roadmap)).
 
 ## How it fits together
 
@@ -83,6 +83,10 @@ uv run python -m zephon_modal placements path/to/job.py
 uv run python -m zephon_modal launch path/to/job.py --run-id <you>-run --steps 20 --placement h100x8
 uv run python -m zephon_modal launch path/to/job.py --run-id <you>-run --steps 40 --placement h100x4
 uv run python -m zephon_modal compare path/to/job.py --reference <ref-run> --candidate <you>-run
+
+uv run python -m zephon_modal supervise path/to/job.py --run-id <you>-run --steps 1000
+uv run python -m zephon_modal status path/to/job.py --run-id <you>-run
+uv run python -m zephon_modal cancel path/to/job.py --run-id <you>-run
 ```
 
 `--steps` is the total to reach, not steps to add. Reusing a run ID resumes
@@ -90,9 +94,39 @@ it. Use `--detach` for anything long: without it, Modal stops the app if this
 client disconnects.
 
 With Zephon's CLI installed too (on Zephon `main` after v0.2.1), the same
-commands are `zephon modal placements|launch|compare ...`: zephon-modal
+commands are `zephon modal <command> ...`: zephon-modal
 registers itself as a `zephon.cli` plugin. zephon-modal doesn't depend on
 zephon, so `python -m zephon_modal` keeps working without it.
+
+## Supervisor
+
+`supervise` starts a small, non-preemptible CPU function in the job's app,
+detached, and returns. It runs one launch at a time and decides where:
+
+- **The most preferred placement that isn't cooling down** gets the next
+  launch.
+- **Queued past `--queue-timeout`** (15 min; at first, or while a restart
+  waits for containers): the supervisor cancels the launch, cools that
+  placement down for `--cooldown` (30 min), and tries the next.
+- **Preempted:** Modal restarts the launch on the same placement by itself.
+  Past `--max-restarts` (2) restarts, the supervisor cancels it, cools the
+  placement down, and moves on.
+- **Hit the function's `timeout`:** launch again; the run resumes from its
+  checkpoint.
+- **Failed:** launch again, up to `--max-failures` (1) in a row, then give up.
+
+A cancelled launch stops its trainer and commits, as on a preemption. The
+supervisor never stops a healthy launch to move up; cooled-down placements
+come back for the next launch. Its state is `<run_dir>/supervisor.json`, which
+`status` prints; `cancel` cancels the supervisor, which cancels its launch.
+Each container records its attempt in `launches/` when it starts, and that is
+how the supervisor tells a running launch from a queued one: Modal's call
+graph left `task_id` empty for running launches.
+
+A supervisor stops after 24 hours (Modal's longest timeout), leaving its
+launch running unsupervised. `supervise` refuses to start while that launch
+still runs (two launches would write the same run); run it again once the
+launch ends, or set the job's `timeout` so launches end sooner.
 
 ## Preemption
 
@@ -118,8 +152,8 @@ makes that restart a clean resume:
   Megatron's tracker file at the latest good one) before torchrun starts.
 - **Every attempt is recorded** in `launches/<launch_id>/`: `launch.json` for
   what was asked, one `<task_id>.json` per container and attempt for how it
-  went (`outcome` completed, failed or stopped; the checkpoint it resumed
-  from; any it set aside; the latest at the end).
+  went (`outcome` running, then completed, failed, stopped or cancelled;
+  the checkpoint it resumed from; any it set aside; the latest at the end).
 
 A stopped run loses the steps since its last periodic checkpoint. Saving on
 the way out (`Megatron(checkpoint_on_shutdown=True)`, which adds
