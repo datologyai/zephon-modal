@@ -38,8 +38,12 @@ class Zephon(DataContract):
 
     canonical_replicas: int
 
+    def __post_init__(self) -> None:
+        if self.canonical_replicas < 1:
+            raise ValueError("canonical_replicas must be positive")
+
     def check_dp_size(self, dp: int) -> None:
-        if self.canonical_replicas % dp:
+        if dp < 1 or self.canonical_replicas % dp:
             raise ValueError(
                 f"doesn't divide canonical_replicas={self.canonical_replicas}; "
                 "Zephon can only train and resume on DP degrees that divide it"
@@ -72,3 +76,12 @@ def settings(ctx: LaunchContext | None = None) -> ZephonSettings:
         return ZephonSettings(canonical_replicas=data["canonical_replicas"], aggregate_store=data["aggregate_store"])
     except KeyError:
         raise RuntimeError("This job's data contract isn't zephon_modal.zephon.Zephon") from None
+
+
+def validate_step_size(microbatches_per_step: int, ctx: LaunchContext | None = None) -> None:
+    """Reject partial lane windows before the trainer consumes any data."""
+    lanes = settings(ctx).canonical_replicas
+    if microbatches_per_step < 1 or microbatches_per_step % lanes:
+        raise ValueError(
+            f"microbatches_per_step={microbatches_per_step} must be a positive multiple of canonical_replicas={lanes}"
+        )

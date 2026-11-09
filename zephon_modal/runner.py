@@ -7,23 +7,33 @@
 under a different Modal function name each time. It stays a plain
 module-level function so the container can import it by name; everything
 launch-specific arrives as a :class:`RunSpec`.
+
+A launch is one Modal call. Modal restarts a preempted call on new
+containers, so a launch has one or more *attempts*; every node of a cluster
+belongs to the same attempt. Each container keeps a record under
+``launches/<launch_id>/<task_id>.json`` that the reconciler reads: written
+when it starts, refreshed every :data:`SYNC_SECONDS`, and marked ``ended``
+only in its last commit.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
-import re
 import signal
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from zephon_modal.adapters.base import Adapter
+from zephon_modal.bootstrap import coordinate
 from zephon_modal.checkpoints import discard_incomplete
 from zephon_modal.context import LaunchContext
 from zephon_modal.data import DataContract
@@ -32,18 +42,27 @@ from zephon_modal.verify.hashes import SAMPLE_HASH_SUBDIR
 
 RENDEZVOUS_PORT = 29500
 # Hash files are written per step on local disk (appending to an open file on
-# a Volume duplicated its contents on background commits) and synced to the
-# run directory every HASH_SYNC_SECONDS, so Modal's background commits make
-# them durable before a stopped container's final commit, which may not finish.
+# a Volume duplicated its contents on background commits) and copied to the
+# run directory every SYNC_SECONDS, so Modal's background commits make them
+# durable before a stopped container's final commit, which may not finish.
 LOCAL_SAMPLE_HASH_DIR = "/tmp/zephon-modal/sample-hashes"
-HASH_SYNC_SECONDS = 30.0
+SYNC_SECONDS = 30.0
 CHECKPOINT_SUBDIR = "checkpoint"
 LAUNCHES_SUBDIR = "launches"
+MANIFEST_FILE = "run.json"
 
 
 @dataclass(frozen=True)
 class RunSpec:
-    """Everything one launch needs, pickled into the Modal call."""
+    """Everything one launch needs, pickled into the Modal call.
+
+    Attributes:
+        registry_name: The job's run registry, when the reconciler started
+            this launch. Node 0 checks that the launch is still the run's
+            current one before touching the run directory.
+        attempt_tag: Set by the launch itself: a fresh suffix per attempt,
+            shared by every node, so restarts never mix their sample hashes.
+    """
 
     run_id: str
     steps: int
@@ -56,6 +75,8 @@ class RunSpec:
     runs_volume_name: str
     compile_cache_mount: str | None = None
     compile_cache_volume_name: str | None = None
+    registry_name: str | None = None
+    attempt_tag: str = ""
 
     @property
     def run_dir(self) -> str:
@@ -69,6 +90,8 @@ class NodeTopology:
     nnodes: int
     node_rank: int
     master_addr: str | None
+    # GPUs this node got, when the placement has fallbacks (otherwise its own count).
+    gpus_per_node: int | None = None
 
     def torchrun_args(self) -> list[str]:
         if self.nnodes == 1:
@@ -81,19 +104,27 @@ class NodeTopology:
         ]
 
 
+def allocated_shape(spec: RunSpec, topology: NodeTopology) -> Placement:
+    """The shape this launch got: the placement itself, or the fallback Modal allocated."""
+    if topology.gpus_per_node is None:
+        return spec.placement
+    return spec.placement.allocated(topology.gpus_per_node)
+
+
 def launch_context(spec: RunSpec, topology: NodeTopology) -> LaunchContext:
     """The context this node's trainer processes see."""
+    shape = allocated_shape(spec, topology)
     return LaunchContext(
         run_id=spec.run_id,
         run_dir=spec.run_dir,
         steps=spec.steps,
         seed=spec.seed,
-        launch_id=spec.launch_id,
-        placement=spec.placement.name,
+        launch_id=spec.launch_id + spec.attempt_tag,
+        placement=shape.name,
         nnodes=topology.nnodes,
         node_rank=topology.node_rank,
-        nproc_per_node=spec.placement.gpus_per_node,
-        sample_hash_dir=LOCAL_SAMPLE_HASH_DIR,
+        nproc_per_node=shape.gpus_per_node,
+        sample_hash_dir=local_hash_dir(spec),
         data=spec.data.context(),
     )
 
@@ -111,10 +142,17 @@ def torchrun_command(adapter: Adapter, ctx: LaunchContext, topology: NodeTopolog
     ]
 
 
+def _visible_gpus() -> int:
+    """GPUs in this container; Modal doesn't say which fallback it allocated."""
+    listing = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True).stdout
+    return sum(line.startswith("GPU ") for line in listing.splitlines())
+
+
 def node_topology(placement: Placement) -> NodeTopology:
     """This container's place in the launch, from Modal's cluster info on multi-node placements."""
     if placement.nodes == 1:
-        return NodeTopology(nnodes=1, node_rank=0, master_addr=None)
+        gpus = _visible_gpus() if placement.fallbacks else None
+        return NodeTopology(nnodes=1, node_rank=0, master_addr=None, gpus_per_node=gpus)
     import modal
 
     cluster = modal.Cluster.from_context()
@@ -141,7 +179,7 @@ def new_launch_id() -> str:
 
     Made before the launch and passed in its spec, so every node of a cluster shares it.
     """
-    return time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + "-" + uuid.uuid4().hex[:8]
 
 
 def task_id() -> str:
@@ -153,8 +191,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _launch_dir(spec: RunSpec) -> str:
-    return f"{spec.run_dir}/{LAUNCHES_SUBDIR}/{spec.launch_id}"
+def _launch_dir(run_dir: str, launch_id: str) -> str:
+    return f"{run_dir}/{LAUNCHES_SUBDIR}/{launch_id}"
+
+
+# The heartbeat thread and the main thread both write records and hash files.
+_write_lock = threading.RLock()
 
 
 def _write_atomically(path: str, content: str) -> None:
@@ -171,34 +213,34 @@ def _write_json(path: str, record: Mapping[str, Any]) -> None:
 
 
 def _record_launch(spec: RunSpec, ctx: LaunchContext) -> None:
-    """``launches/<launch_id>/launch.json``: what was asked for. Restarts rewrite the same contents."""
+    """``launches/<launch_id>/launch.json``: what was asked for, and what Modal allocated."""
     if ctx.node_rank != 0:
         return
     record = {
         "launch_id": spec.launch_id,
         "placement": asdict(spec.placement) | {"name": spec.placement.name},
+        "allocated": ctx.placement,
         "world_size": ctx.world_size,
-        "dp": spec.placement.dp_size(spec.adapter.model_parallel_size),
+        "dp": ctx.world_size // spec.adapter.model_parallel_size,
         "steps": spec.steps,
         "seed": spec.seed,
         "data": {"contract": type(spec.data).__qualname__, **spec.data.context()},
     }
-    _write_json(f"{_launch_dir(spec)}/launch.json", record)
+    _write_json(f"{_launch_dir(spec.run_dir, spec.launch_id)}/launch.json", record)
 
 
 def record_attempt(spec: RunSpec, ctx: LaunchContext, record: Mapping[str, Any]) -> None:
-    """``launches/<launch_id>/<task_id>.json``: how one container's attempt went.
+    """``launches/<launch_id>/<task_id>.json``: this container's attempt."""
+    with _write_lock:
+        _write_json(
+            f"{_launch_dir(spec.run_dir, spec.launch_id)}/{task_id()}.json",
+            {"task_id": task_id(), "node_rank": ctx.node_rank, **record},
+        )
 
-    Modal restarts a preempted input on a new container with the same
-    launch ID, so a launch can have several attempts, each with one file
-    per node.
-    """
-    _write_json(f"{_launch_dir(spec)}/{task_id()}.json", {"task_id": task_id(), "node_rank": ctx.node_rank, **record})
 
-
-def launch_attempts(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
-    """Node 0's attempt records for one launch, oldest first."""
-    launch_dir = f"{run_dir}/{LAUNCHES_SUBDIR}/{launch_id}"
+def launch_records(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
+    """Every container's attempt record for one launch, all nodes, oldest first."""
+    launch_dir = _launch_dir(run_dir, launch_id)
     if not os.path.isdir(launch_dir):
         return []
     records = []
@@ -206,20 +248,69 @@ def launch_attempts(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
         if name == "launch.json" or not name.endswith(".json"):
             continue
         with open(f"{launch_dir}/{name}") as record_file:
-            record = json.load(record_file)
-        if record.get("node_rank") == 0:
-            records.append(record)
+            records.append(json.load(record_file))
     return sorted(records, key=lambda record: record["started"])
 
 
-def prepare_resume(spec: RunSpec, ctx: LaunchContext) -> dict[str, Any]:
-    """On node 0, set aside checkpoints a stopped container left incomplete; returns what the resume will load.
+def launch_attempts(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
+    """Node 0's attempt records for one launch, oldest first: one per attempt."""
+    return [record for record in launch_records(run_dir, launch_id) if record.get("node_rank") == 0]
 
-    Runs before torchrun starts, and the trainers can't load until every
-    node has joined the rendezvous, so no node reads a checkpoint while it's moved.
+
+def all_records(run_dir: str) -> list[dict[str, Any]]:
+    """Every attempt record of every launch of the run, each with its ``launch_id``."""
+    launches = f"{run_dir}/{LAUNCHES_SUBDIR}"
+    if not os.path.isdir(launches):
+        return []
+    return [
+        record | {"launch_id": launch_id}
+        for launch_id in sorted(os.listdir(launches))
+        for record in launch_records(run_dir, launch_id)
+    ]
+
+
+def local_hash_dir(spec: RunSpec) -> str:
+    """An attempt-specific local directory; warm containers may execute other runs."""
+    run_key = hashlib.sha256(spec.run_dir.encode()).hexdigest()[:16]
+    return f"{LOCAL_SAMPLE_HASH_DIR}/{run_key}/{spec.launch_id}{spec.attempt_tag}"
+
+
+def check_manifest(spec: RunSpec) -> None:
+    """Write ``run.json`` on a run's first launch; refuse a resume whose data settings differ.
+
+    Only what decides the samples: the seed and the data contract's settings
+    (for Zephon, the canonical replica count). Everything else, from the
+    trainer's flags to this library, may change between launches.
     """
+    manifest = json.loads(
+        json.dumps({"seed": spec.seed, "data": {"contract": type(spec.data).__qualname__, **spec.data.context()}})
+    )
+    path = f"{spec.run_dir}/{MANIFEST_FILE}"
+    if os.path.exists(path):
+        with open(path) as manifest_file:
+            existing = json.load(manifest_file)
+        if existing != manifest:
+            raise ValueError(f"{spec.run_id} was started with {existing}, not {manifest}; use a new run ID")
+        return
+    _write_json(path, manifest)
+
+
+def _check_current(spec: RunSpec) -> None:
+    """Refuse to run a launch the reconciler has moved on from."""
+    if spec.registry_name is None:
+        return
+    from zephon_modal.registry import Registry
+
+    state = Registry.from_name(spec.registry_name).state(spec.run_id)
+    current = getattr(state, "current", None) or {}
+    if current.get("launch_id") != spec.launch_id:
+        raise RuntimeError(f"Launch {spec.launch_id} is no longer {spec.run_id}'s current launch")
+
+
+def prepare_resume(spec: RunSpec) -> dict[str, Any]:
+    """On node 0, set aside incomplete checkpoints; returns what the resume will load."""
     layout = spec.adapter.checkpoints
-    if ctx.node_rank != 0 or layout is None:
+    if layout is None:
         return {}
     cleanup = discard_incomplete(layout, spec.run_dir, tag=task_id())
     if cleanup.discarded:
@@ -227,49 +318,81 @@ def prepare_resume(spec: RunSpec, ctx: LaunchContext) -> dict[str, Any]:
     return {"resume_from": cleanup.latest, "discarded_checkpoints": cleanup.discarded}
 
 
-def _restore_sample_hashes(spec: RunSpec, ctx: LaunchContext) -> None:
-    """Bring back this node's hash files from an earlier attempt of the same launch.
+def bootstrap_attempt(spec: RunSpec, topology: NodeTopology) -> tuple[RunSpec, dict[str, Any]]:
+    """Give this attempt its tag and make every node resume from the same checkpoint.
 
-    A restarted attempt keeps the launch ID and so the file names; without
-    this, its copy at exit would replace the earlier attempt's steps. The
-    trainer appends to these, and :func:`~zephon_modal.verify.compare.load_step_digests`
-    keeps a file's last record for each step.
+    Node 0 checks the launch is current, checks the manifest, sets aside
+    incomplete checkpoints and commits; then every other node reloads its
+    view of the Volume and confirms it sees the same latest checkpoint
+    before any trainer starts.
     """
-    run_hash_dir = f"{spec.run_dir}/{SAMPLE_HASH_SUBDIR}"
-    if not os.path.isdir(run_hash_dir):
-        return
-    first_rank = ctx.node_rank * ctx.nproc_per_node
-    for name in os.listdir(run_hash_dir):
-        match = re.fullmatch(rf"{re.escape(spec.launch_id)}-dp\d+-rank(\d+)\.jsonl", name)
-        if match is None or not first_rank <= int(match.group(1)) < first_rank + ctx.nproc_per_node:
-            continue
-        with open(f"{run_hash_dir}/{name}") as hash_file:
-            content = hash_file.read()
-        # A kill mid-write can leave half a line.
-        content = content[: content.rfind("\n") + 1]
-        os.makedirs(LOCAL_SAMPLE_HASH_DIR, exist_ok=True)
-        with open(f"{LOCAL_SAMPLE_HASH_DIR}/{name}", "w") as local_file:
-            local_file.write(content)
+    import modal
+
+    volume = modal.Volume.from_name(spec.runs_volume_name)
+
+    def prepare() -> dict[str, Any]:
+        volume.reload()
+        _check_current(spec)
+        check_manifest(spec)
+        previous = launch_attempts(spec.run_dir, spec.launch_id)
+        sequence = 1 + max((record.get("attempt_sequence", 0) for record in previous), default=0)
+        state = {"attempt_tag": f".a{sequence:04d}", "attempt_sequence": sequence, **prepare_resume(spec)}
+        volume.commit()
+        return state
+
+    def refresh(state: dict[str, Any]) -> None:
+        volume.reload()
+        layout = spec.adapter.checkpoints
+        if layout is not None and layout.latest_complete(spec.run_dir) != state.get("resume_from"):
+            raise RuntimeError("Cluster nodes disagree on the checkpoint to resume from")
+
+    state = coordinate(
+        key=spec.launch_id,
+        nodes=topology.nnodes,
+        rank=topology.node_rank,
+        master_addr=topology.master_addr,
+        prepare=prepare,
+        refresh=refresh,
+    )
+    return dataclasses.replace(spec, attempt_tag=state["attempt_tag"]), state
 
 
-_hash_sync_lock = threading.Lock()
+_synced: dict[str, tuple[int, float]] = {}
 
 
 def sync_sample_hashes(spec: RunSpec) -> None:
-    """Copy this node's hash files into the run directory, complete lines only."""
-    if not os.path.isdir(LOCAL_SAMPLE_HASH_DIR):
+    """Copy this node's changed hash files into the run directory, complete lines only."""
+    local_dir = local_hash_dir(spec)
+    if not os.path.isdir(local_dir):
         return
-    # The periodic sync and the final one share temp file names.
-    with _hash_sync_lock:
-        for name in os.listdir(LOCAL_SAMPLE_HASH_DIR):
-            with open(f"{LOCAL_SAMPLE_HASH_DIR}/{name}") as hash_file:
-                content = hash_file.read()
+    with _write_lock:
+        for name in sorted(os.listdir(local_dir)):
+            source = f"{local_dir}/{name}"
+            stat = os.stat(source)
+            if _synced.get(source) == (stat.st_size, stat.st_mtime):
+                continue
+            with open(source) as source_file:
+                content = source_file.read()
             _write_atomically(f"{spec.run_dir}/{SAMPLE_HASH_SUBDIR}/{name}", content[: content.rfind("\n") + 1])
+            _synced[source] = (stat.st_size, stat.st_mtime)
 
 
-def _sync_sample_hashes_until(spec: RunSpec, done: threading.Event) -> None:
-    while not done.wait(HASH_SYNC_SECONDS):
+def _heartbeat(spec: RunSpec, ctx: LaunchContext, attempt: dict[str, Any], done: threading.Event) -> None:
+    """Sync hashes and refresh the attempt record until the trainer stops.
+
+    Errors are logged, never fatal: a dead heartbeat would get a healthy
+    launch cancelled as unresponsive.
+    """
+    while not done.wait(SYNC_SECONDS):
+        _beat(spec, ctx, attempt)
+
+
+def _beat(spec: RunSpec, ctx: LaunchContext, attempt: dict[str, Any]) -> None:
+    try:
         sync_sample_hashes(spec)
+        record_attempt(spec, ctx, dict(attempt) | {"heartbeat": _now()})
+    except Exception as error:
+        print(f"[zephon_modal] heartbeat failed, retrying in {SYNC_SECONDS:.0f}s: {error!r}", flush=True)
 
 
 def start_trainer(
@@ -277,13 +400,11 @@ def start_trainer(
 ) -> subprocess.Popen:
     """Record the launch and start torchrun for this node.
 
-    Pair with :func:`finish_launch` once the trainer exits. ``extra_env``
-    reaches every trainer process (e.g. profiling switches).
+    ``extra_env`` reaches every trainer process (e.g. profiling switches).
     """
     ctx = launch_context(spec, topology)
     os.makedirs(spec.run_dir, exist_ok=True)
     _record_launch(spec, ctx)
-    _restore_sample_hashes(spec, ctx)
     # Unbuffered: torchrun sends worker output through files, and buffered
     # output reaches the logs in late chunks, or not at all if the trainer is killed.
     env = (
@@ -295,7 +416,7 @@ def start_trainer(
         | ctx.to_env()
     )
     command = torchrun_command(spec.adapter, ctx, topology)
-    print(f"[zephon_modal] {spec.run_id} launch {spec.launch_id} on {spec.placement.name}: {' '.join(command)}")
+    print(f"[zephon_modal] {spec.run_id} launch {ctx.launch_id} on {ctx.placement}: {' '.join(command)}")
     # Its own session: Modal's SIGINT goes to the whole process group, and the
     # runner, not every rank at once, decides how the trainer stops.
     return subprocess.Popen(command, cwd=spec.adapter.workdir(), env=env, start_new_session=True)
@@ -307,7 +428,7 @@ def stop_trainer(trainer: subprocess.Popen, adapter: Adapter) -> int | None:
     Returns torchrun's exit code, or ``None`` if it had to be killed.
     """
     started = time.monotonic()
-    print(f"[zephon_modal] container stopping: sending {adapter.shutdown_signal.name} to the trainer")
+    print(f"[zephon_modal] stopping the trainer with {adapter.shutdown_signal.name}")
     trainer.send_signal(adapter.shutdown_signal)
     try:
         returncode = trainer.wait(timeout=adapter.shutdown_timeout)
@@ -327,14 +448,9 @@ def _commit(volume_name: str) -> None:
 
 
 def finish_launch(spec: RunSpec) -> list[str]:
-    """Move sample hashes into the run and commit Volumes; returns the checkpoint steps present.
-
-    Call it whether or not training succeeded, so the next container sees
-    whatever checkpoints exist.
-    """
+    """Commit the Volumes; returns the checkpoint directories present."""
     import modal
 
-    sync_sample_hashes(spec)
     _commit(spec.runs_volume_name)
     if spec.compile_cache_volume_name is not None:
         modal.Volume.from_name(spec.compile_cache_volume_name).commit()
@@ -343,54 +459,103 @@ def finish_launch(spec: RunSpec) -> list[str]:
 
 
 def train_node(spec: RunSpec) -> list[str]:
-    """Run one node of a launch; returns the checkpoint steps present afterwards.
+    """Run one node of a launch; returns the checkpoint directories present afterwards.
 
-    If Modal stops the container (it raises ``KeyboardInterrupt`` here) or the
-    call is cancelled (``InputCancellation``), the trainer is stopped, the
-    Volume committed, and the exception re-raised: Modal restarts a stopped
-    input, and a cancelled one ends.
+    If Modal stops the container (``KeyboardInterrupt`` here) or the call is
+    cancelled (``InputCancellation``), the trainer is stopped and the Volume
+    committed before the exception propagates: Modal restarts a stopped
+    input, and a cancelled one ends. Modal gives a grace period for all of it
+    (about 30 seconds in our tests; its docs don't give a length), so hashes
+    are synced first and the trainer gets ``shutdown_timeout``.
     """
     from modal.exception import InputCancellation
 
     topology = node_topology(spec.placement)
     ctx = launch_context(spec, topology)
-    attempt: dict[str, Any] = {"started": _now(), "placement": spec.placement.name, **prepare_resume(spec, ctx)}
-    # Recorded and committed now, so the supervisor sees the launch running
-    # (and a restart as a new task ID) without waiting for it to end.
-    record_attempt(spec, ctx, attempt | {"outcome": "running"})
-    _commit(spec.runs_volume_name)
-    trainer = start_trainer(spec, topology)
-    syncing_done = threading.Event()
-    threading.Thread(target=_sync_sample_hashes_until, args=(spec, syncing_done), daemon=True).start()
+    attempt: dict[str, Any] = {
+        "started": _now(),
+        "placement": spec.placement.name,
+        "allocated": ctx.placement,
+        "outcome": "starting",
+    }
+    trainer: subprocess.Popen | None = None
+    done = threading.Event()
+    heartbeat: threading.Thread | None = None
     try:
+        # Before anything else touches the Volume, so the reconciler waits for this container.
+        record_attempt(spec, ctx, attempt)
+        _commit(spec.runs_volume_name)
+        spec, resume = bootstrap_attempt(spec, topology)
+        ctx = launch_context(spec, topology)
+        attempt |= resume | {"outcome": "running"}
+        trainer = start_trainer(spec, topology)
+        record_attempt(spec, ctx, attempt)
+        heartbeat = threading.Thread(target=_heartbeat, args=(spec, ctx, attempt, done), daemon=True)
+        heartbeat.start()
         returncode = trainer.wait()
         attempt |= {"outcome": "completed" if returncode == 0 else "failed", "returncode": returncode}
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, trainer.args)
     except (KeyboardInterrupt, InputCancellation) as stop:
-        # One stop is enough; ignore any repeat while we clean up (Modal cancels with SIGUSR1).
+        # One stop is enough; ignore repeats while cleaning up (Modal cancels with SIGUSR1).
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        attempt["outcome"] = "cancelled" if isinstance(stop, InputCancellation) else "stopped"
         # Every step hashed so far, before anything slow: the final commit may not finish.
         sync_sample_hashes(spec)
-        outcome = "cancelled" if isinstance(stop, InputCancellation) else "stopped"
-        attempt |= {"outcome": outcome, "returncode": stop_trainer(trainer, spec.adapter)}
+        raise
+    except BaseException:
+        if attempt["outcome"] in ("starting", "running"):
+            attempt["outcome"] = "failed"
         raise
     finally:
-        syncing_done.set()
-        attempt["ended"] = _now()
+        if trainer is not None and trainer.poll() is None:
+            attempt["returncode"] = stop_trainer(trainer, spec.adapter)
+        done.set()
+        if heartbeat is not None:
+            heartbeat.join(timeout=2)
+        sync_sample_hashes(spec)
         if spec.adapter.checkpoints is not None and ctx.node_rank == 0:
-            attempt["latest_checkpoint"] = spec.adapter.checkpoints.latest_complete(spec.run_dir)
-        record_attempt(spec, ctx, attempt)
+            try:
+                attempt["latest_checkpoint"] = spec.adapter.checkpoints.latest_complete(spec.run_dir)
+            except Exception as error:
+                # Only a note for the record; the final commit below matters more.
+                print(f"[zephon_modal] couldn't read the latest checkpoint: {error!r}", flush=True)
+        # "ended" goes out in the final commit, so the reconciler sees it only once everything else is durable.
+        record_attempt(spec, ctx, attempt | {"ended": _now()})
         checkpoints = finish_launch(spec)
-    if returncode:
-        raise subprocess.CalledProcessError(returncode, trainer.args)
     return checkpoints
 
 
-def compare(runs_mount: str, runs_volume_name: str, reference: str, candidate: str) -> list[dict]:
+def replays(runs_mount: str, runs_volume_name: str, run_id: str) -> list[dict]:
+    """Check one run's replayed steps against each other, on the runs Volume."""
+    import modal
+
+    from zephon_modal.verify.compare import check_replays
+
+    modal.Volume.from_name(runs_volume_name).reload()
+    return check_replays(f"{runs_mount}/{run_id}")
+
+
+def compare(
+    runs_mount: str,
+    runs_volume_name: str,
+    reference: str,
+    candidate: str,
+    steps: int | None = None,
+    start_step: int = 1,
+    rows_per_step: int | None = None,
+) -> list[dict]:
     """Compare two runs' sample hashes on the runs Volume."""
     import modal
 
     from zephon_modal.verify.compare import compare_runs
 
     modal.Volume.from_name(runs_volume_name).reload()
-    return compare_runs(f"{runs_mount}/{reference}", f"{runs_mount}/{candidate}")
+    return compare_runs(
+        f"{runs_mount}/{reference}",
+        f"{runs_mount}/{candidate}",
+        steps=steps,
+        start_step=start_step,
+        rows_per_step=rows_per_step,
+    )

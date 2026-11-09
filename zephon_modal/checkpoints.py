@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import pickle
 import re
+import shutil
 from dataclasses import dataclass, field
 
 DISCARDED_SUBDIR = "discarded-checkpoints"
@@ -70,8 +71,23 @@ class CheckpointLayout:
         }
 
     def latest_complete(self, run_dir: str) -> int | None:
-        """The latest step a resume can load."""
-        return max((step for step, path in self.steps(run_dir).items() if dcp_complete(path)), default=None)
+        """The latest step a resume can load.
+
+        Checks from the newest checkpoint down and stops at the first complete
+        one, so the cost doesn't grow with a long run's checkpoint count: a
+        checkpoint that was complete once stays complete.
+        """
+        return next(iter(self.newest_complete(run_dir, 1)), None)
+
+    def newest_complete(self, run_dir: str, count: int) -> list[int]:
+        """Up to ``count`` complete steps, newest first, checking only as far back as needed."""
+        found = []
+        for step, path in sorted(self.steps(run_dir).items(), reverse=True):
+            if len(found) == count:
+                break
+            if dcp_complete(path):
+                found.append(step)
+        return found
 
 
 @dataclass(frozen=True)
@@ -86,16 +102,19 @@ def discard_incomplete(layout: CheckpointLayout, run_dir: str, tag: str) -> Chec
     """Move incomplete checkpoints to ``<run_dir>/discarded-checkpoints`` and point the tracker at the latest complete one.
 
     Moved, not deleted, so a wrong verdict loses nothing. ``tag`` (e.g. the
-    container ID) keeps names unique across attempts.
+    container ID) keeps names unique across attempts. Only checkpoints newer
+    than the latest complete one are looked at: an older incomplete one is
+    never loaded, and checking every checkpoint would make each launch slower
+    the longer the run.
     """
+    latest = layout.latest_complete(run_dir)
     discarded = []
     for step, path in sorted(layout.steps(run_dir).items()):
-        if not dcp_complete(path):
+        if latest is None or step > latest:
             target_dir = os.path.join(run_dir, DISCARDED_SUBDIR)
             os.makedirs(target_dir, exist_ok=True)
             os.rename(path, os.path.join(target_dir, f"{os.path.basename(path)}-{tag}"))
             discarded.append(step)
-    latest = layout.latest_complete(run_dir)
     if layout.tracker is not None and discarded:
         tracker = os.path.join(run_dir, layout.subdir, layout.tracker)
         if latest is None:
@@ -105,3 +124,33 @@ def discard_incomplete(layout: CheckpointLayout, run_dir: str, tag: str) -> Chec
             with open(tracker, "w") as tracker_file:
                 tracker_file.write(str(latest))
     return CheckpointCleanup(latest=latest, discarded=discarded)
+
+
+def prune(layout: CheckpointLayout, run_dir: str, keep: int) -> list[int]:
+    """Delete checkpoints older than the ``keep`` latest complete ones; returns the steps deleted.
+
+    Trainers can't do this themselves on a multi-node launch (see
+    :attr:`~zephon_modal.context.LaunchContext.keep_all_checkpoints`), so the
+    reconciler does it from its own, committed view of the Volume. The latest
+    complete checkpoint, which any resume loads, is always kept, and so is
+    anything newer than it (a save that may still be in progress).
+    """
+    if keep < 1:
+        raise ValueError(f"keep must be at least 1, got {keep}")
+    kept = layout.newest_complete(run_dir, keep)
+    if len(kept) < keep:
+        return []
+    deleted = []
+    for step, path in sorted(layout.steps(run_dir).items()):
+        if step < kept[-1]:
+            # A trainer pruning its own checkpoints may have got there first.
+            shutil.rmtree(path, ignore_errors=True)
+            deleted.append(step)
+    # Set-aside partial saves older than anything kept are no use either.
+    discarded_dir = os.path.join(run_dir, DISCARDED_SUBDIR)
+    if os.path.isdir(discarded_dir):
+        for name in os.listdir(discarded_dir):
+            match = re.match(layout.step_pattern, name)
+            if match and int(match.group(1)) < kept[-1]:
+                shutil.rmtree(os.path.join(discarded_dir, name), ignore_errors=True)
+    return deleted

@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import os
 import subprocess
 import sys
@@ -129,32 +130,98 @@ def test_stop_trainer_kills_a_trainer_that_outlasts_the_timeout():
     assert time.monotonic() - started < 5
 
 
-def test_restart_restores_this_nodes_hash_files(tmp_path, monkeypatch):
-    local = tmp_path / "local"
-    monkeypatch.setattr(runner, "LOCAL_SAMPLE_HASH_DIR", str(local))
-    spec = dataclasses.replace(_spec(Placement("H100:8", nodes=2)), runs_mount=str(tmp_path))
-    run_hashes = tmp_path / "r1" / SAMPLE_HASH_SUBDIR
-    run_hashes.mkdir(parents=True)
-    for rank in (7, 8, 15):
-        (run_hashes / hash_file_name(spec.launch_id, 16, rank)).write_text('{"step": 1}\n{"step": 2')
-    (run_hashes / hash_file_name("20261101T000000", 16, 8)).write_text('{"step": 1}\n')
+def test_each_attempt_hashes_into_its_own_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "LOCAL_SAMPLE_HASH_DIR", str(tmp_path))
+    spec = _spec(Placement("H100:8"))
+    first = launch_context(dataclasses.replace(spec, attempt_tag=".a0001"), NodeTopology(1, 0, None))
+    second = launch_context(dataclasses.replace(spec, attempt_tag=".a0002"), NodeTopology(1, 0, None))
+    assert first.launch_id == spec.launch_id + ".a0001"
+    assert first.sample_hash_dir != second.sample_hash_dir
 
-    ctx = launch_context(spec, NodeTopology(2, 1, "10.0.0.1"))
-    runner._restore_sample_hashes(spec, ctx)
 
-    # Node 1 holds global ranks 8-15, and only this launch's files; the half-written line is dropped.
-    assert sorted(os.listdir(local)) == [hash_file_name(spec.launch_id, 16, r) for r in (8, 15)]
-    assert (local / hash_file_name(spec.launch_id, 16, 8)).read_text() == '{"step": 1}\n'
+def _synced_spec(tmp_path, monkeypatch) -> RunSpec:
+    monkeypatch.setattr(runner, "LOCAL_SAMPLE_HASH_DIR", str(tmp_path / "local"))
+    monkeypatch.setattr(runner, "_synced", {})
+    spec = dataclasses.replace(_spec(Placement("H100:4")), runs_mount=str(tmp_path), attempt_tag=".a0001")
+    os.makedirs(runner.local_hash_dir(spec))
+    return spec
 
 
 def test_sync_copies_complete_lines_only(tmp_path, monkeypatch):
-    local = tmp_path / "local"
-    local.mkdir()
-    monkeypatch.setattr(runner, "LOCAL_SAMPLE_HASH_DIR", str(local))
-    spec = dataclasses.replace(_spec(Placement("H100:4")), runs_mount=str(tmp_path))
+    spec = _synced_spec(tmp_path, monkeypatch)
     name = hash_file_name(spec.launch_id, 4, 0)
-    (local / name).write_text('{"step": 1}\n{"step": 2')
+    with open(f"{runner.local_hash_dir(spec)}/{name}", "w") as local_file:
+        local_file.write('{"step": 1}\n{"step": 2')
     runner.sync_sample_hashes(spec)
     synced = tmp_path / "r1" / SAMPLE_HASH_SUBDIR
     assert os.listdir(synced) == [name]
     assert (synced / name).read_text() == '{"step": 1}\n'
+
+
+def test_sync_skips_files_that_havent_changed(tmp_path, monkeypatch):
+    spec = _synced_spec(tmp_path, monkeypatch)
+    name = hash_file_name(spec.launch_id, 4, 0)
+    local = f"{runner.local_hash_dir(spec)}/{name}"
+    with open(local, "w") as local_file:
+        local_file.write('{"step": 1}\n')
+    runner.sync_sample_hashes(spec)
+    synced = tmp_path / "r1" / SAMPLE_HASH_SUBDIR / name
+    synced.write_text("sentinel")
+    runner.sync_sample_hashes(spec)
+    assert synced.read_text() == "sentinel"
+    with open(local, "a") as local_file:
+        local_file.write('{"step": 2}\n')
+    runner.sync_sample_hashes(spec)
+    assert synced.read_text() == '{"step": 1}\n{"step": 2}\n'
+
+
+def test_manifest_allows_changes_that_dont_affect_the_data(tmp_path):
+    spec = dataclasses.replace(_spec(Placement("H100:4")), runs_mount=str(tmp_path))
+    runner.check_manifest(spec)
+    runner.check_manifest(dataclasses.replace(spec, steps=500, adapter=Torchtitan(module="other", config="big")))
+    with pytest.raises(ValueError, match="use a new run ID"):
+        runner.check_manifest(dataclasses.replace(spec, seed=7))
+    with pytest.raises(ValueError, match="use a new run ID"):
+        runner.check_manifest(dataclasses.replace(spec, data=Zephon(canonical_replicas=32)))
+
+
+def test_launch_attempts_are_node_zero_records_oldest_first(tmp_path):
+    launch_dir = tmp_path / "r1" / "launches" / "L1"
+    launch_dir.mkdir(parents=True)
+    records = {
+        "ta-2.json": {"task_id": "ta-2", "node_rank": 0, "started": "2026-11-09T01:00:00+00:00"},
+        "ta-1.json": {"task_id": "ta-1", "node_rank": 0, "started": "2026-11-09T00:00:00+00:00", "ended": "x"},
+        "ta-9.json": {"task_id": "ta-9", "node_rank": 1, "started": "2026-11-09T01:00:00+00:00"},
+        "launch.json": {"launch_id": "L1"},
+    }
+    for name, record in records.items():
+        (launch_dir / name).write_text(json.dumps(record))
+    run_dir = str(tmp_path / "r1")
+    assert [r["task_id"] for r in runner.launch_attempts(run_dir, "L1")] == ["ta-1", "ta-2"]
+    assert len(runner.launch_records(run_dir, "L1")) == 3
+    assert len(runner.all_records(run_dir)) == 3
+
+
+def test_heartbeat_survives_a_failed_write(tmp_path, monkeypatch, capsys):
+    import threading
+
+    spec = dataclasses.replace(_spec(Placement("H100:4")), runs_mount=str(tmp_path))
+    ctx = launch_context(spec, NodeTopology(1, 0, None))
+    monkeypatch.setattr(runner, "SYNC_SECONDS", 0.01)
+    beats = []
+
+    def flaky_record(spec, ctx, record):
+        beats.append(record)
+        if len(beats) == 1:
+            raise OSError("Volume hiccup")
+
+    monkeypatch.setattr(runner, "record_attempt", flaky_record)
+    done = threading.Event()
+    thread = threading.Thread(target=runner._heartbeat, args=(spec, ctx, {"outcome": "running"}, done))
+    thread.start()
+    while len(beats) < 3:
+        time.sleep(0.01)
+    done.set()
+    thread.join(timeout=2)
+    assert "heartbeat failed" in capsys.readouterr().out
+    assert all("heartbeat" in beat for beat in beats)

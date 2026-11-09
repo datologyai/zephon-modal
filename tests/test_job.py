@@ -66,3 +66,25 @@ def test_rejects_unnamed_runs_volume():
     # An ephemeral Volume has no name; building one needs a Modal connection.
     with pytest.raises(ValueError, match="named Volumes"):
         _job(runs_volume=SimpleNamespace(name=None))
+
+
+def test_registers_a_scheduled_reconciler_and_a_registry():
+    job = _job()
+    assert job.registry_name == "test-job-runs"
+    assert job._reconcile is not None and set(job.functions) == {"2xh100x8", "h100x8", "h100x4"}
+
+
+def test_timeout_is_bounded_by_modals_limit():
+    with pytest.raises(ValueError, match="timeout"):
+        _job(timeout=25 * 60 * 60)
+
+
+def test_reconciler_specs_name_the_registry():
+    job = _job()
+    assert job.run_spec("r1", 30, job.placement(), registry=job.registry_name).registry_name == "test-job-runs"
+    assert job.run_spec("r1", 30, job.placement()).registry_name is None
+
+
+def test_timeout_has_modals_lower_bound_too():
+    with pytest.raises(ValueError, match="between 10 and"):
+        _job(timeout=5)

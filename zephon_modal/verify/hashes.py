@@ -17,10 +17,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 ROW_HASH_BYTES = 8
 SAMPLE_HASH_SUBDIR = "sample-hashes"
+SEGMENT_STEPS = 1000
 
 
 def row_hash(row: bytes) -> str:
@@ -28,9 +29,28 @@ def row_hash(row: bytes) -> str:
     return hashlib.blake2b(row, digest_size=ROW_HASH_BYTES).hexdigest()
 
 
+def pack_fields(fields: Mapping[str, bytes]) -> bytes:
+    """Encode named training fields unambiguously before hashing a sequence."""
+    parts = []
+    for name, value in sorted(fields.items()):
+        key = name.encode()
+        parts.extend([len(key).to_bytes(8, "big"), key, len(value).to_bytes(8, "big"), value])
+    return b"".join(parts)
+
+
 def hash_file_name(launch_id: str, dp_world_size: int, global_rank: int) -> str:
     """One file per rank per launch; the launch ID prefix lets the latest launch win."""
     return f"{launch_id}-dp{dp_world_size}-rank{global_rank:03d}.jsonl"
+
+
+def segment_path(path: str, step: int) -> str:
+    """The file holding ``step``'s record: ``path`` split every :data:`SEGMENT_STEPS` steps.
+
+    The runner copies changed hash files to the Volume every few seconds by
+    rewriting them, so a multi-day launch keeps each rewrite small.
+    """
+    stem, extension = os.path.splitext(path)
+    return f"{stem}-s{step // SEGMENT_STEPS:05d}{extension}"
 
 
 class StepHashRecorder:
@@ -48,9 +68,13 @@ class StepHashRecorder:
         dp_rank: int,
         microbatches_per_step: int,
         consumed_microbatches: int = 0,
+        schema: str = "tokens-v1",
     ) -> None:
+        if dp_world_size < 1 or microbatches_per_step < 1 or not 0 <= dp_rank < dp_world_size:
+            raise ValueError("DP size and step size must be positive, with a valid DP rank")
         if microbatches_per_step % dp_world_size:
             raise ValueError(f"microbatches_per_step={microbatches_per_step} not divisible by DP={dp_world_size}")
+        self._schema = schema
         self._path = path
         self._dp_world_size = dp_world_size
         self._dp_rank = dp_rank
@@ -76,6 +100,7 @@ class StepHashRecorder:
         self._consumed_microbatches += self._dp_world_size
         if self._consumed_microbatches % self._microbatches_per_step == 0:
             record = {
+                "schema": self._schema,
                 "step": self._consumed_microbatches // self._microbatches_per_step,
                 "dp": self._dp_world_size,
                 "dp_rank": self._dp_rank,
@@ -83,6 +108,6 @@ class StepHashRecorder:
             }
             # Local disk, opened per step: appending to an open file on a
             # Modal Volume duplicated its contents on background commits.
-            with open(self._path, "a") as hash_file:
+            with open(segment_path(self._path, record["step"]), "a") as hash_file:
                 hash_file.write(json.dumps(record) + "\n")
             self._step_hashes = []
