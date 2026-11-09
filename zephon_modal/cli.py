@@ -1,7 +1,7 @@
 # Copyright 2026 DatologyAI
 # SPDX-License-Identifier: Apache-2.0
 
-"""``zephon modal`` (or ``python -m zephon_modal``): launch, inspect and compare runs of a job file.
+"""``zephon modal`` (or ``python -m zephon_modal``): start, follow and compare runs of a job file.
 
 A job file is a Python module that defines an :class:`ElasticJob` (``job``
 by default; pick another with ``path/to/file.py:name``).
@@ -17,9 +17,9 @@ import argparse
 import importlib.util
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from zephon_modal.supervisor import Policy
+from zephon_modal.reconcile import Policy
 
 if TYPE_CHECKING:
     from zephon_modal.job import ElasticJob
@@ -51,80 +51,131 @@ def load_job(target: str) -> ElasticJob:
 def _placements(args: argparse.Namespace) -> int:
     job = load_job(args.job)
     for index, placement in enumerate(job.placements):
-        dp = placement.dp_size(job.adapter.model_parallel_size)
-        note = job.data.describe_dp_size(dp)
-        print(
-            f"{index}  {placement.name:<16} {placement.nodes} x {placement.gpu:<8} "
-            f"world {placement.world_size:>3}  dp {dp:>3}" + (f"  {note}" if note else "")
-        )
+        print(f"{index}  {placement.name}")
+        # A placement with fallbacks is one Modal function; Modal picks the first shape it can allocate.
+        for rank, shape in enumerate(placement.shapes):
+            dp = shape.dp_size(job.adapter.model_parallel_size)
+            note = job.data.describe_dp_size(dp)
+            print(
+                f"   {'or ' if rank else '   '}{shape.nodes} x {shape.gpu:<8} "
+                f"world {shape.world_size:>3}  dp {dp:>3}" + (f"  {note}" if note else "")
+            )
     return 0
 
 
-def _launch(args: argparse.Namespace) -> int:
-    job = load_job(args.job)
-    checkpoints = job.launch(args.run_id, args.steps, placement=args.placement, seed=args.seed, detach=args.detach)
-    print(f"{args.run_id} on {job.placement(args.placement).name}: checkpoints {checkpoints}")
+def _deploy(args: argparse.Namespace) -> int:
+    load_job(args.job).deploy()
     return 0
 
 
-def _compare(args: argparse.Namespace) -> int:
-    from zephon_modal.verify.compare import format_report, identical
-
-    job = load_job(args.job)
-    rows = job.compare(args.reference, args.candidate)
-    print(format_report(rows))
-    return 0 if identical(rows) else 1
-
-
-def _supervise(args: argparse.Namespace) -> int:
+def _start(args: argparse.Namespace) -> int:
     job = load_job(args.job)
     policy = Policy(
         queue_timeout=args.queue_timeout,
         max_restarts=args.max_restarts,
-        max_failures=args.max_failures,
         cooldown=args.cooldown,
+        stall_timeout=args.stall_timeout,
+        max_failures=args.max_failures,
+        keep_checkpoints=args.keep_checkpoints,
+        max_gpu_hours=args.max_gpu_hours,
     )
     try:
-        call_id = job.supervise(args.run_id, args.steps, seed=args.seed, policy=policy)
+        job.start(args.run_id, args.steps, seed=args.seed, policy=policy, deploy=not args.no_deploy)
     except RuntimeError as error:
-        print(f"zephon modal supervise: error: {error}", file=sys.stderr)
+        print(f"zephon modal start: error: {error}", file=sys.stderr)
         return 1
-    print(f"Supervising {args.run_id} to step {args.steps} (call {call_id}). Follow it with:")
+    print(f"Started {args.run_id}, to step {args.steps}. Follow it with:")
     print(f"  zephon modal status {args.job} --run-id {args.run_id}")
     return 0
 
 
-def format_status(record: dict) -> str:
-    """A supervisor record as text."""
-    state = record["status"] + ("" if record.get("alive") or record["status"] != "running" else " (supervisor gone)")
-    lines = [f"{record['run_id']}: {state}, target step {record['steps']}"]
+def format_status(record: dict[str, Any]) -> str:
+    """A reconciler record as text."""
+    lines = [
+        f"{record['run_id']}: {record['status']}, target step {record['steps']}, checkpoint {record['checkpoint']}"
+    ]
     if record.get("current"):
         current = record["current"]
-        lines.append(f"current: {current['placement']} launch {current['launch_id']} since {current['started']}")
+        lines.append(f"current: {current['placement']} launch {current['launch_id']} (call {current['call_id']})")
     cooling = record.get("cooling_until") or {}
     if cooling:
         lines.append("cooling down: " + ", ".join(f"{name} until {until}" for name, until in cooling.items()))
-    for event in record.get("events", []):
+    for event in record.get("events", [])[-30:]:
         detail = ", ".join(f"{key}={value}" for key, value in event.items() if key not in ("time", "event"))
-        lines.append(f"  {event['time']}  {event['event']:<18} {detail}")
+        lines.append(f"  {event['time']}  {event['event']:<20} {detail}")
     return "\n".join(lines)
 
 
 def _status(args: argparse.Namespace) -> int:
     record = load_job(args.job).status(args.run_id)
     if record is None:
-        print(f"{args.run_id} has never been supervised")
+        print(f"{args.run_id} has never been started")
         return 1
     print(format_status(record))
     return 0
 
 
-def _cancel(args: argparse.Namespace) -> int:
-    if load_job(args.job).cancel(args.run_id):
-        print(f"Cancelled {args.run_id}'s supervisor; its launch stops and commits")
-        return 0
-    print(f"{args.run_id} has no running supervisor")
-    return 1
+def _stop(args: argparse.Namespace) -> int:
+    try:
+        load_job(args.job).stop(args.run_id)
+    except RuntimeError as error:
+        print(f"zephon modal stop: error: {error}", file=sys.stderr)
+        return 1
+    print(f"Stopping {args.run_id}: its launch stops its trainer and commits; check `status`")
+    return 0
+
+
+def _recover(args: argparse.Namespace) -> int:
+    job = load_job(args.job)
+    record = job.status(args.run_id) or {}
+    current = record.get("current") or {}
+    if not args.yes:
+        print(
+            f"{args.run_id}'s launch {current.get('launch_id')} (call {current.get('call_id')}) never confirmed it stopped."
+        )
+        print("Recover only once none of its containers is running (Modal dashboard, or `modal container list`).")
+        if input("Continue? [y/N] ").strip().lower() != "y":
+            return 1
+    try:
+        job.recover(args.run_id)
+    except RuntimeError as error:
+        print(f"zephon modal recover: error: {error}", file=sys.stderr)
+        return 1
+    print(f"{args.run_id} will continue on the next reconcile")
+    return 0
+
+
+def _launch(args: argparse.Namespace) -> int:
+    job = load_job(args.job)
+    try:
+        checkpoints = job.launch(args.run_id, args.steps, placement=args.placement, seed=args.seed, detach=args.detach)
+    except RuntimeError as error:
+        print(f"zephon modal launch: error: {error}", file=sys.stderr)
+        return 1
+    print(f"{args.run_id} on {job.placement(args.placement).name}: checkpoints {checkpoints}")
+    return 0
+
+
+def _replays(args: argparse.Namespace) -> int:
+    from zephon_modal.verify.compare import MISMATCH, format_replays
+
+    rows = load_job(args.job).replays(args.run_id)
+    print(format_replays(rows))
+    return 1 if any(row["status"] == MISMATCH for row in rows) else 0
+
+
+def _compare(args: argparse.Namespace) -> int:
+    from zephon_modal.verify.compare import format_report, identical
+
+    job = load_job(args.job)
+    options = {}
+    if args.steps is not None:
+        options = {"steps": args.steps, "start_step": args.start_step, "rows_per_step": args.rows_per_step}
+    elif args.rows_per_step is not None or args.start_step != 1:
+        raise SystemExit("--start-step and --rows-per-step require --steps")
+    rows = job.compare(args.reference, args.candidate, **options)
+    print(format_report(rows))
+    return 0 if identical(rows, strict=args.steps is not None) else 1
 
 
 def register(parser: argparse.ArgumentParser) -> None:
@@ -132,62 +183,78 @@ def register(parser: argparse.ArgumentParser) -> None:
 
     Each subcommand sets ``func`` to a handler that returns an exit code.
     """
-    parser.description = "Launch, inspect and compare elastic training runs on Modal."
+    parser.description = "Start, follow and compare elastic training runs on Modal."
     commands = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
-    placements = commands.add_parser("placements", help="List a job's placements and their DP degrees")
-    placements.add_argument("job", help="path/to/job.py[:attribute]")
-    placements.set_defaults(func=_placements)
+    def command(name: str, help: str, func: Any, run_id: bool = True) -> argparse.ArgumentParser:
+        sub = commands.add_parser(name, help=help)
+        sub.add_argument("job", help="path/to/job.py[:attribute]")
+        if run_id:
+            sub.add_argument("--run-id", required=True)
+        sub.set_defaults(func=func)
+        return sub
 
-    launch = commands.add_parser("launch", help="Train a run on one placement, resuming it if it exists")
-    launch.add_argument("job", help="path/to/job.py[:attribute]")
-    launch.add_argument("--run-id", required=True, help="Reusing an ID resumes that run")
+    command("placements", "List a job's placements and their DP degrees", _placements, run_id=False)
+    command("deploy", "Deploy the job's app (its reconciler and training functions)", _deploy, run_id=False)
+
+    start = command("start", "Deploy, then train a run to its step target across placements", _start)
+    start.add_argument("--steps", type=int, required=True, help="Total steps to reach, not steps to add")
+    start.add_argument("--seed", type=int, default=42, help="Zephon seed; must stay fixed for a run")
+    start.add_argument("--no-deploy", action="store_true", help="Use the app as last deployed")
+    defaults = Policy()
+    start.add_argument(
+        "--queue-timeout",
+        type=float,
+        default=defaults.queue_timeout,
+        help="Seconds to wait for containers before moving on",
+    )
+    start.add_argument(
+        "--max-restarts", type=int, default=defaults.max_restarts, help="Preemptions of one launch before moving on"
+    )
+    start.add_argument(
+        "--cooldown", type=float, default=defaults.cooldown, help="Seconds a placement is skipped after moving off it"
+    )
+    start.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=defaults.stall_timeout,
+        help="Seconds running without a new checkpoint before relaunching",
+    )
+    start.add_argument(
+        "--max-failures",
+        type=int,
+        default=defaults.max_failures,
+        help="Failures in a row without progress before giving up",
+    )
+    start.add_argument("--keep-checkpoints", type=int, help="Delete all but this many latest complete checkpoints")
+    start.add_argument("--max-gpu-hours", type=float, help="Give up after this many GPU hours in total")
+
+    command("status", "Show a run's state and recent events", _status)
+    command("stop", "Stop a run (its launch commits on the way out)", _stop)
+    recover = command("recover", "Continue a run whose last launch never confirmed it stopped", _recover)
+    recover.add_argument("--yes", action="store_true", help="Skip the confirmation")
+
+    launch = command(
+        "launch", "Train a run on one placement now, without the reconciler (references, experiments)", _launch
+    )
     launch.add_argument("--steps", type=int, required=True, help="Total steps to reach, not steps to add")
     launch.add_argument("--placement", help="Placement name (see `placements`); defaults to the first")
     launch.add_argument("--seed", type=int, default=42, help="Zephon seed; must stay fixed for a run")
-    launch.add_argument(
-        "--detach", action="store_true", help="Keep running if this client disconnects (use for long runs)"
-    )
-    launch.set_defaults(func=_launch)
+    launch.add_argument("--detach", action="store_true", help="Keep running if this client disconnects")
 
-    supervise = commands.add_parser(
-        "supervise", help="Train a run to its step target, moving between placements as needed (detached)"
+    command(
+        "replays",
+        "Check a run against itself: steps re-trained after a resume must match their first training",
+        _replays,
     )
-    supervise.add_argument("job", help="path/to/job.py[:attribute]")
-    supervise.add_argument("--run-id", required=True, help="Reusing an ID resumes that run")
-    supervise.add_argument("--steps", type=int, required=True, help="Total steps to reach, not steps to add")
-    supervise.add_argument("--seed", type=int, default=42, help="Zephon seed; must stay fixed for a run")
-    supervise.add_argument(
-        "--queue-timeout",
-        type=float,
-        default=Policy.queue_timeout,
-        help="Seconds to wait for containers before trying the next placement",
-    )
-    supervise.add_argument(
-        "--max-restarts", type=int, default=Policy.max_restarts, help="Preemptions on one launch before moving on"
-    )
-    supervise.add_argument(
-        "--max-failures", type=int, default=Policy.max_failures, help="Failed launches in a row before giving up"
-    )
-    supervise.add_argument(
-        "--cooldown", type=float, default=Policy.cooldown, help="Seconds a placement is skipped after giving up on it"
-    )
-    supervise.set_defaults(func=_supervise)
-
-    status = commands.add_parser("status", help="Show a supervised run's placements and events")
-    status.add_argument("job", help="path/to/job.py[:attribute]")
-    status.add_argument("--run-id", required=True)
-    status.set_defaults(func=_status)
-
-    cancel = commands.add_parser("cancel", help="Stop a supervised run (its launch commits on the way out)")
-    cancel.add_argument("job", help="path/to/job.py[:attribute]")
-    cancel.add_argument("--run-id", required=True)
-    cancel.set_defaults(func=_cancel)
 
     compare = commands.add_parser("compare", help="Check two runs trained on the same samples at every step")
     compare.add_argument("job", help="path/to/job.py[:attribute]")
     compare.add_argument("--reference", required=True)
     compare.add_argument("--candidate", required=True)
+    compare.add_argument("--steps", type=int, help="Require complete matching evidence through this step")
+    compare.add_argument("--start-step", type=int, default=1, help="First required step (default: 1)")
+    compare.add_argument("--rows-per-step", type=int, help="Required global sequence count per step")
     compare.set_defaults(func=_compare)
 
 

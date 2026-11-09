@@ -1,13 +1,16 @@
 # Copyright 2026 DatologyAI
 # SPDX-License-Identifier: Apache-2.0
 
-"""Smoke job: zephon_modal's launch, resume and compare path on cheap GPUs.
+"""Smoke job: zephon_modal's start, resume and compare path on cheap GPUs.
 
+    export ZEPHON_MODAL_SMOKE_PREFIX=<you>-smoke   # deployed app names are shared across the workspace
     python -m zephon_modal placements examples/smoke/job.py
-    python -m zephon_modal launch examples/smoke/job.py --run-id <you>-smoke-ref --steps 10 --placement t4x2
-    python -m zephon_modal launch examples/smoke/job.py --run-id <you>-smoke --steps 5 --placement t4x2
-    python -m zephon_modal launch examples/smoke/job.py --run-id <you>-smoke --steps 10 --placement t4x1
-    python -m zephon_modal compare examples/smoke/job.py --reference <you>-smoke-ref --candidate <you>-smoke
+    python -m zephon_modal launch examples/smoke/job.py --run-id <you>-ref --steps 40 --placement t4x2
+    python -m zephon_modal start examples/smoke/job.py:preempt --run-id <you>-run --steps 40
+    python -m zephon_modal status examples/smoke/job.py:preempt --run-id <you>-run
+    modal container stop <task>   # mid-run, to rehearse a preemption
+    python -m zephon_modal compare examples/smoke/job.py --reference <you>-ref --candidate <you>-run --steps 40
+    modal app stop <you>-smoke-preempt   # deployed apps keep their reconciler schedule until stopped
 
 Set ZEPHON_MODAL_SMOKE_VOLUME to use your own runs Volume.
 """
@@ -61,13 +64,15 @@ runs_volume = modal.Volume.from_name(
 )
 
 
-def smoke_job(name: str, adapter: FakeTrainer, timeout: int = 10 * 60) -> ElasticJob:
+def smoke_job(
+    name: str, adapter: FakeTrainer, timeout: int = 10 * 60, placements: list[Placement] | None = None
+) -> ElasticJob:
     """A fake-trainer job on one or two T4s."""
     return ElasticJob(
         name=name,
         image=image,
         adapter=adapter,
-        placements=[Placement("T4:2"), Placement("T4")],
+        placements=placements or [Placement("T4:2"), Placement("T4")],
         runs_volume=runs_volume,
         cpu=2.0,
         memory=4096,
@@ -75,11 +80,18 @@ def smoke_job(name: str, adapter: FakeTrainer, timeout: int = 10 * 60) -> Elasti
     )
 
 
-job = smoke_job("zephon-modal-smoke", FakeTrainer())
+PREFIX = os.environ.get("ZEPHON_MODAL_SMOKE_PREFIX", "zephon-modal-smoke")
+job = smoke_job(PREFIX, FakeTrainer())
 # Slow steps, so a container can be stopped mid-run (`modal container stop`)
 # to rehearse a preemption. `preempt` exits without saving; `preempt_save`
 # saves on the way out.
-preempt = smoke_job("zephon-modal-smoke-preempt", FakeTrainer(step_seconds=3.0), timeout=20 * 60)
+preempt = smoke_job(f"{PREFIX}-preempt", FakeTrainer(step_seconds=3.0), timeout=20 * 60)
 preempt_save = smoke_job(
-    "zephon-modal-smoke-preempt-save", FakeTrainer(step_seconds=3.0, checkpoint_on_shutdown=True), timeout=20 * 60
+    f"{PREFIX}-preempt-save", FakeTrainer(step_seconds=3.0, checkpoint_on_shutdown=True), timeout=20 * 60
 )
+# Launches end at Modal's function timeout after two minutes, as a day-long
+# run's do at 24 hours; the reconciler relaunches them and they resume.
+short_timeout = smoke_job(f"{PREFIX}-timeout", FakeTrainer(step_seconds=3.0), timeout=120)
+# One Modal function asking for ["T4:2", "T4"]: Modal allocates whichever it
+# can, and the launch sizes itself from the GPUs it got.
+fallback = smoke_job(f"{PREFIX}-fallback", FakeTrainer(), placements=[Placement("T4:2", fallbacks=("T4",))])

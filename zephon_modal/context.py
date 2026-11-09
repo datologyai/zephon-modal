@@ -29,7 +29,7 @@ class LaunchContext:
         run_dir: Checkpoints, sample hashes and launch records live here.
         steps: Total optimizer steps to reach, not steps to add.
         seed: Data seed. Changing it mid-run changes the data.
-        launch_id: Sortable UTC timestamp identifying this launch.
+        launch_id: Sortable launch identity plus the cluster-wide execution attempt suffix.
         placement: Name of the placement this launch runs on.
         nnodes: Nodes in this launch.
         node_rank: This node's rank.

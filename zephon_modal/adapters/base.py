@@ -30,7 +30,8 @@ class Adapter:
     When Modal stops a container (preemption, ``modal container stop``),
     the runner sends torchrun ``shutdown_signal``, which it forwards to every
     rank, then waits up to ``shutdown_timeout`` seconds before killing the
-    trainer and committing the Volume. Modal allows 30 seconds in all, and the
+    trainer and committing the Volume. Modal's grace period covers all of it
+    (about 30 seconds in our tests; its docs don't give a length), and the
     commit needs the rest: it uploads whatever the trainer wrote since the
     last background commit, such as a half-written checkpoint.
 

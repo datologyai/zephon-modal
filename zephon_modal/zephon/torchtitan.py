@@ -22,7 +22,8 @@ from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan_recipes.zephon import ZephonDataLoader
 
 from zephon_modal.context import context
-from zephon_modal.verify.hashes import StepHashRecorder, hash_file_name
+from zephon_modal.verify.hashes import StepHashRecorder, hash_file_name, pack_fields
+from zephon_modal.zephon import validate_step_size
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class SampleHashingZephonDataLoader(ZephonDataLoader):
     def __init__(
         self, config: Config, *, dp_world_size: int, dp_rank: int, max_context_length: int, **kwargs: Any
     ) -> None:
+        validate_step_size(config.microbatches_per_step)
         super().__init__(
             config, dp_world_size=dp_world_size, dp_rank=dp_rank, max_context_length=max_context_length, **kwargs
         )
@@ -56,6 +58,7 @@ class SampleHashingZephonDataLoader(ZephonDataLoader):
             dp_world_size=dp_world_size,
             dp_rank=dp_rank,
             microbatches_per_step=config.microbatches_per_step,
+            schema="torchtitan-batch-v2",
         )
 
     def __iter__(self) -> Iterator[TokenizedTrainingMicrobatch]:
@@ -71,8 +74,21 @@ class SampleHashingZephonDataLoader(ZephonDataLoader):
                     self._dp_rank,
                     time.perf_counter() - iter_start,
                 )
-            rows = microbatch.input.reshape(-1, self._seq_len)
-            self._hashes.record(row.numpy().tobytes() for row in rows)
+            fields = {
+                "input": microbatch.input,
+                "labels": microbatch.labels,
+                "positions": microbatch.positions,
+                "padding_mask": microbatch.padding_mask,
+            }
+            if microbatch.model_kwargs:
+                raise ValueError("Sample hashing does not yet support extra model_kwargs")
+            rows = {name: tensor.reshape(-1, self._seq_len) for name, tensor in fields.items()}
+            self._hashes.record(
+                pack_fields(
+                    {name + ":" + str(tensor.dtype): tensor[index].numpy().tobytes() for name, tensor in rows.items()}
+                )
+                for index in range(len(rows["input"]))
+            )
             yield microbatch
 
     def state_dict(self) -> dict[str, bytes]:

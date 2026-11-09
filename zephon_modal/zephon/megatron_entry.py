@@ -28,7 +28,8 @@ from typing import Any
 import torch.distributed as dist
 
 from zephon_modal.context import context
-from zephon_modal.verify.hashes import StepHashRecorder, hash_file_name
+from zephon_modal.verify.hashes import StepHashRecorder, hash_file_name, pack_fields
+from zephon_modal.zephon import validate_step_size
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,13 @@ class SampleHashingIterator:
             )
         else:
             batch = next(self._loader)
-        self._hashes.record(row.numpy().tobytes() for row in batch["tokens"])
+        names = ("tokens", "labels", "loss_mask", "position_ids")
+        if any(name not in batch for name in names):
+            raise ValueError("Training batch lacks fields required for complete sample hashing")
+        self._hashes.record(
+            pack_fields({name + ":" + str(batch[name].dtype): batch[name][index].numpy().tobytes() for name in names})
+            for index in range(len(batch["tokens"]))
+        )
         return batch
 
     def __getattr__(self, name: str) -> Any:
@@ -83,6 +90,7 @@ def _install_sample_hashing() -> None:
         dp_world_size = mpu.get_data_parallel_world_size()
         dp_rank = mpu.get_data_parallel_rank()
         microbatches_per_step = get_num_microbatches() * dp_world_size
+        validate_step_size(microbatches_per_step, ctx)
         hashes = StepHashRecorder(
             os.path.join(ctx.sample_hash_dir, hash_file_name(ctx.launch_id, dp_world_size, dist.get_rank())),
             dp_world_size=dp_world_size,
@@ -91,6 +99,7 @@ def _install_sample_hashing() -> None:
             # Megatron restores the iteration from its own checkpoint, so the
             # global count needn't live in dataloader state.
             consumed_microbatches=get_args().iteration * microbatches_per_step,
+            schema="megatron-batch-v2",
         )
         return SampleHashingIterator(loader, hashes, dp_rank), valid, test
 
