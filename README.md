@@ -1,50 +1,116 @@
 # zephon-modal
 
-Elastic, deterministic training runs on [Modal](https://modal.com) with
-[Zephon](https://github.com/datologyai/zephon). You describe one recipe and
-the physical shapes it may run on. A run moves between those shapes as
-capacity comes and goes, resumes from its latest checkpoint each time, and
-still trains on exactly the same samples at every step. `compare` checks
-that.
+**Long training runs on [Modal](https://modal.com) that survive preemption,
+move between GPU shapes, and can prove they trained on the right data.**
 
-**Status: early, private.** Meant to carry a multi-day torchtitan run; see
-[Before a long run](#before-a-long-run) for what has and hasn't been
-exercised.
+A multi-day run on Modal will get preempted, will hit Modal's 24-hour function
+limit, and will sometimes find the GPUs it wants unavailable. zephon-modal
+keeps that run going. You give it one training recipe and a ranked list of GPU
+shapes it may use; it launches the run, resumes it from the latest checkpoint
+after every interruption, and moves it to another shape when it has to.
 
-## How it fits together
+Moving between shapes changes the data-parallel (DP) degree, and with most
+data loaders that changes which samples each step trains on.
+[Zephon](https://github.com/datologyai/zephon)'s loader doesn't: a run sees
+the same samples at every step whether it's on 16 GPUs or 4. zephon-modal
+hashes every sample a run trains on, so you can check that instead of taking
+it on faith.
 
-- **Placements** are physical shapes, in order of preference:
-  `Placement("H100:8", nodes=2)`, `Placement("H100:8", fallbacks=("H100:4",))`.
-  Each becomes its own Modal function (`train-<placement>`), because Modal
-  fixes a function's GPU spec and cluster size when it's defined. A
-  single-node placement can list fallbacks: Modal allocates the first shape it
-  can, and the launch sizes itself from the GPUs it got. Fallbacks are for
-  single-node placements only: Modal's docs don't say whether a cluster can
-  take them, and we haven't tested it, so make each cluster size its own
-  placement. Modal has no API for
-  available capacity, so fallbacks and moving between placements are how a
-  run gets GPUs sooner.
-- **Adapters** say how to launch a framework's trainer under torchrun:
-  `Torchtitan` and `Megatron`. They're plain data; recipe-specific code is
-  named by import string and runs inside the container.
-- **A data contract** says which data-parallel degrees the loader allows and
-  what settings trainers see. The default allows any DP degree.
-  `zephon_modal.zephon.Zephon` is the one that makes resizes deterministic:
-  Zephon divides the data into lanes (`canonical_replicas`), and a run can
-  train or resume at any DP degree that divides the lane count. Its
-  `aggregate_store` is always `torch://`: Volume writes don't reach other
-  containers until commit and reload, so a shared directory can't work.
-- **Recipes read the launch from `zephon_modal.context()`** (run directory,
-  step target, seed, launch ID, node and rank counts) and Zephon's settings
-  from `zephon_modal.zephon.settings()`.
-- **Sample hashes** are the proof. Each DP rank hashes every sequence it
-  trains on (tokens, labels, positions and masks) per step; `compare` treats
-  a step as a multiset, so runs at different DP degrees match when they saw
-  the same data.
-- **The reconciler** keeps started runs going. It's a scheduled function in
-  the job's deployed app; see [Reconciler](#reconciler).
+> **Status: early.** Built to carry multi-day torchtitan runs. Rehearsed on
+> T4s and H100s, with injected stops, but not yet run for longer than a day.
+> See [What's been tested](#whats-been-tested).
 
-## A job file
+## How it works
+
+```mermaid
+flowchart LR
+    CLI["zephon_modal start / stop"] -->|requests| Registry[("Run registry<br/>(Modal Dict)")]
+    Reconciler["Reconciler<br/>(runs every 5 min)"] <-->|plan, state| Registry
+    Reconciler -->|launch| P1["Placement 1<br/>2 × H100:8, DP 16"]
+    Reconciler -.->|if that can't run| P2["Placement 2<br/>1 × H100:8 or H100:4, DP 8 or 4"]
+    P1 & P2 -->|checkpoints, sample hashes| Volume[("Runs Volume")]
+```
+
+- **A job** is a Python file holding one `ElasticJob`: your training image,
+  how to launch the trainer, and where it may run.
+- **Placements** are the GPU shapes the run may use, best first, such as a
+  2-node H100:8 cluster, then a single node. Each becomes its own Modal
+  function.
+- **Adapters** launch a framework's trainer under torchrun. There are two:
+  `Torchtitan` and `Megatron`.
+- **The data contract** says which DP degrees are allowed. With
+  `Zephon(canonical_replicas=16)`, the data is split into 16 lanes and the run
+  can train on any DP degree that divides 16.
+- **The reconciler** is a scheduled function in the job's Modal app. Every few
+  minutes it checks each run and takes at most one step: launch, relaunch,
+  move to the next placement, or give up. Nothing long-lived has to stay up.
+- **Sample hashes** are the proof. Each DP rank records a hash of every
+  sequence it trains on, per step. `compare` and `replays` check them.
+
+[docs/design.md](docs/design.md) has the details: every decision the
+reconciler makes, how a preempted run resumes cleanly, and why.
+
+## Try it: the smoke test
+
+`examples/smoke` runs the whole loop with a fake trainer on T4s, for a few
+cents. You need a Modal account (`modal setup`) and [uv](https://docs.astral.sh/uv/).
+
+```bash
+git clone git@github.com:datologyai/zephon-modal.git && cd zephon-modal
+uv sync --group dev
+```
+
+App and Volume names are shared across a Modal workspace, so prefix yours:
+
+```bash
+export ZEPHON_MODAL_SMOKE_PREFIX=<you>-smoke ZEPHON_MODAL_SMOKE_VOLUME=<you>-smoke-runs
+```
+
+1. Train a 40-step reference run on one T4:
+
+   ```bash
+   uv run python -m zephon_modal launch examples/smoke/job.py --run-id <you>-ref --steps 40 --placement t4x1
+   ```
+
+2. Start the run under test. `start` deploys the app and hands the run to the
+   reconciler:
+
+   ```bash
+   uv run python -m zephon_modal start examples/smoke/job.py:preempt --run-id <you>-run --steps 40
+   ```
+
+3. Watch it with `status`. Once it has a checkpoint, stop its container to
+   simulate a preemption, using the task ID `status` shows:
+
+   ```bash
+   uv run python -m zephon_modal status examples/smoke/job.py:preempt --run-id <you>-run
+   modal container stop <task>
+   ```
+
+4. When it finishes, check it trained on the same samples as the reference,
+   then stop the deployed app (it keeps its reconciler schedule until you do):
+
+   ```bash
+   uv run python -m zephon_modal compare examples/smoke/job.py --reference <you>-ref --candidate <you>-run --steps 40
+   modal app stop <you>-smoke-preempt
+   ```
+
+You should see Modal restart the launch, the reconciler record the restart,
+the run finish, and `compare` report 40/40 steps matching.
+
+`examples/smoke/job.py` has other variants: `short_timeout` ends every launch
+after two minutes (as a long run's launches end at 24 hours), and `fallback`
+asks one function for either of two shapes.
+
+## A real run: torchtitan on H100s
+
+[examples/torchtitan](examples/torchtitan/README.md) is a runnable Qwen3-0.6B
+job on [torchtitan-zephon](https://github.com/datologyai/torchtitan-zephon),
+reading FineWeb-Edu. It moves between a 2-node H100:8 cluster and a single
+H100:8-or-H100:4 node. Its README walks through staging the data, starting a
+run, checking it, and rehearsing preemptions.
+
+## Writing your own job
 
 ```python
 import modal
@@ -52,245 +118,117 @@ from zephon_modal import ElasticJob, Placement, Torchtitan
 from zephon_modal.zephon import Zephon
 
 job = ElasticJob(
-    name="qwen3",
-    image=training_image,  # framework + zephon>=0.2.1 + your recipe modules
+    name="qwen3",                       # the Modal app name
+    image=training_image,               # framework + zephon>=0.2.1 + your recipe modules
     adapter=Torchtitan(module="my_recipes", config="qwen3_0p6b_zephon"),
-    data=Zephon(canonical_replicas=16),
-    placements=[Placement("H100:8", nodes=2), Placement("H100:8", fallbacks=("H100:4",))],
+    data=Zephon(canonical_replicas=16), # any DP degree dividing 16
+    placements=[
+        Placement("H100:8", nodes=2),                   # preferred: 2 nodes, DP 16
+        Placement("H100:8", fallbacks=("H100:4",)),     # then one node, DP 8 or 4
+    ],
     runs_volume=modal.Volume.from_name("my-runs", create_if_missing=True, version=2),
     volumes={"/data": modal.Volume.from_name("my-data")},
     compile_cache_volume=modal.Volume.from_name("my-compile-cache", create_if_missing=True, version=2),
-    alert_secret=modal.Secret.from_name("my-slack-webhook"),  # provides ZEPHON_MODAL_ALERT_WEBHOOK
+    alert_secret=modal.Secret.from_name("my-slack-webhook"),  # optional: provides ZEPHON_MODAL_ALERT_WEBHOOK
 )
 ```
 
-In the torchtitan recipe, use `SampleHashingZephonDataLoader.Config` from
-`zephon_modal.zephon.torchtitan`; take `canonical_replicas` and
-`aggregate_store` from `zephon_modal.zephon.settings()`, and `run_id` and the
-step target from `zephon_modal.context()`. Have the trainer keep every
-checkpoint (torchtitan's `keep_latest_k=0`) and pass `--keep-checkpoints` to
-`start` instead: on a cluster each node sees only its own uncommitted files,
-so a trainer pruning there leaves partial checkpoints behind. For
-Megatron-LM-zephon, pass `Megatron(args="my_recipes:pretrain_args",
-script="pretrain_gpt_zephon.py", entry="zephon_modal.zephon.megatron_entry")`.
-Both wrappers reject a step that isn't a whole number of lane windows.
+Your recipe needs three changes to run under zephon-modal:
+
+1. **Read the launch from zephon-modal.** Take `run_id` and the step target
+   from `zephon_modal.context()`, and `canonical_replicas` and
+   `aggregate_store` from `zephon_modal.zephon.settings()`.
+2. **Hash samples.** In torchtitan, use `SampleHashingZephonDataLoader.Config`
+   from `zephon_modal.zephon.torchtitan`. For Megatron-LM-zephon, use
+   `Megatron(args="my_recipes:pretrain_args", script="pretrain_gpt_zephon.py",
+   entry="zephon_modal.zephon.megatron_entry")`.
+3. **Keep every checkpoint in the trainer** (torchtitan's `keep_latest_k=0`)
+   and pass `--keep-checkpoints N` to `start` instead. On a multi-node cluster,
+   a trainer that prunes its own checkpoints leaves partial ones behind;
+   [docs/design.md](docs/design.md#preemption) explains why.
+
+Run `placements` on your job file to see each placement's name and the DP
+degree it gives.
 
 ## Commands
 
-```bash
-uv sync --group dev
-uv run python -m zephon_modal placements path/to/job.py
-uv run python -m zephon_modal start path/to/job.py --run-id <you>-run --steps 100000 --keep-checkpoints 3
-uv run python -m zephon_modal status path/to/job.py --run-id <you>-run
-uv run python -m zephon_modal stop path/to/job.py --run-id <you>-run
-uv run python -m zephon_modal recover path/to/job.py --run-id <you>-run
-uv run python -m zephon_modal launch path/to/job.py --run-id <you>-ref --steps 200 --placement h100x8
-uv run python -m zephon_modal compare path/to/job.py --reference <you>-ref --candidate <you>-run --steps 200
-uv run python -m zephon_modal replays path/to/job.py --run-id <you>-run
-uv run python -m zephon_modal stop-after path/to/job.py --run-id <you>-run --after 40 120
-```
+Every command takes the job file first (`path/to/job.py`, or
+`path/to/job.py:attribute` if the job isn't named `job`). With a Zephon
+install that has its CLI (`main` after v0.2.1), `zephon modal <command>` works
+too.
 
-`start` deploys the job's app and hands the run to the reconciler, which
-takes it from there. `--steps` is the total to reach. Starting a finished or stopped
-run again resumes it. `launch` trains on one placement right now, without the
-reconciler: for references and experiments. A deployed app keeps its
-reconciler schedule until you `modal app stop` it.
+| Command | What it does |
+|---|---|
+| `placements` | List the job's placements and the DP degree each gives. |
+| `deploy` | Deploy the job's app (its reconciler and training functions). |
+| `start --run-id R --steps N` | Deploy, then train run `R` to `N` total steps across placements. Starting a stopped or finished run again resumes it. |
+| `status --run-id R` | Show the run's state, its current launch, and recent events. |
+| `stop --run-id R` | Stop the run. Its launch stops the trainer and commits. |
+| `recover --run-id R` | Continue a run whose last launch never confirmed it stopped. Check its containers are gone first. |
+| `launch --run-id R --steps N --placement P` | Train on one placement now, without the reconciler. For reference runs and experiments. |
+| `compare --reference A --candidate B` | Check two runs trained on the same samples at every step. |
+| `replays --run-id R` | Check a run against itself: steps re-trained after a resume must match their first training. |
+| `stop-after --run-id R --after 40 120` | Rehearse preemptions: stop the run's container after the checkpoints at those steps. |
 
-With Zephon's CLI installed (Zephon `main` after v0.2.1), the same commands
-are `zephon modal <command> ...`.
+`start` takes the reconciler's limits too: `--queue-timeout`,
+`--max-restarts`, `--cooldown`, `--stall-timeout`, `--max-failures`,
+`--max-lost`, `--keep-checkpoints` and `--max-gpu-hours`. See `--help` and
+[what the reconciler decides](docs/design.md#what-it-decides-each-tick).
 
-## Reconciler
+A deployed app keeps running its reconciler every few minutes until you
+`modal app stop` it.
 
-Nothing long-lived watches a run. The deployed app has a `reconcile`
-function that Modal calls every `reconcile_minutes` (5 by default) and
-right after `start`, `stop` or `recover`. Each call looks at every active run once, takes at most one
-decision, and exits. Modal runs one call at a time (`max_containers=1`), so
-there is exactly one decision-maker with no locks, and no process that can
-outlive Modal's 24-hour limit or die holding the run.
+## Checking a run
 
-Runs live in a Modal Dict, `<app>-runs`: the plan (a spec per placement,
-and the policy), the state, and pending start/stop/recover requests. The CLI
-only writes requests; the reconciler alone writes plans and state, so a
-second `start` of an active run is ignored rather than racing the first. The
-state is also mirrored to `<run_dir>/reconciler.json`.
+There are two checks, both built on the sample hashes:
 
-Each tick, for each run:
-
-- **No current launch:** launch on the most preferred placement that isn't
-  cooling down.
-- **Queued past `--queue-timeout`** (15 min), at first or while a restart
-  waits for containers: cancel, cool the placement down for `--cooldown`
-  (30 min), move on.
-- **Preempted:** Modal restarts the launch on the same placement by itself.
-  Past `--max-restarts` (2), cancel, cool down, move on.
-- **Running without a new checkpoint for `--stall-timeout`** (1 h): treat it
-  as hung and cancel; it counts as a failure. So does a launch with a node,
-  any node of the running attempt, whose heartbeat has gone quiet or that
-  has exited while the others run, for 5 min: torchrun on the rest could
-  otherwise wait on it until the stall timeout.
-- **Hit the function `timeout`** (24 h by default): launch again; it resumes.
-- **Failed:** cool the placement down and launch again, on the next
-  placement if there is one, so a bad node or shape doesn't take every retry.
-  After `--max-failures` (3) in a row without a new checkpoint, give up.
-- **Lost by Modal** (`InternalFailure`, Modal's own failure): the same, but
-  against `--max-lost` (10) instead: it says nothing about the trainer, so it
-  shouldn't use up the failure budget. A `RemoteError` still counts as a
-  failure: a container that crashed or ran out of memory looks like one.
-- **Modal can't be asked** (connection or service errors): use the
-  containers' heartbeats instead, which come from the registry, and never
-  cancel only for not knowing. If it lasts, the 2-hour quiet alert says so.
-- **New checkpoint:** reset the failure counts, and with `--keep-checkpoints N`
-  delete all but the latest N complete checkpoints, from the reconciler's
-  committed view of the Volume.
-- **`--max-gpu-hours`:** give up once the run's attempts add up to that.
-
-**One writer at a time.** Before any successor launch, the old one must
-*drain*: its call has ended and every container it started has recorded its
-final commit. Each container publishes an attempt record to the registry
-before touching the run, refreshes it every 30 s, and marks it ended only
-after its last Volume commit has returned. These records live in the Dict,
-not on the Volume: a Dict write is atomic and immediately visible, while a
-reader can catch a Volume commit half-applied (we saw records read back
-empty). A launch also checks, before touching the run, that it is still the
-run's current launch, and checks again with every heartbeat: if the
-reconciler has moved on (after a `recover`, or a spawn that failed on our
-side but not Modal's), the launch stops its trainer and commits. A failed
-read of the registry isn't a reason to stop. If a launch doesn't
-confirm it stopped within 10 minutes, the run waits for an operator: check
-that its containers are gone, then `recover`. A launch that has already
-ended and confirmed is replaced in the same tick.
-
-**Alerts** go to `ZEPHON_MODAL_ALERT_WEBHOOK` (a Slack-compatible incoming
-webhook, from `alert_secret`): give-ups, runs needing recovery, no new
-checkpoint for 2 hours, and completion.
-
-## Preemption
-
-When Modal preempts a container (or you run `modal container stop`), it
-sends SIGINT to the function's process group, kills the container after a
-grace period (about 30 seconds in our tests; Modal's docs don't give a
-length), and restarts the same input on new containers. On a cluster, stopping
-one node stops and restarts them all. zephon-modal makes the restart a clean
-resume:
-
-- **The runner, not each rank, stops the trainer.** torchrun runs in its own
-  session, so Modal's SIGINT reaches only the runner. It syncs hashes, sends
-  torchrun the adapter's `shutdown_signal` (SIGTERM), waits up to
-  `shutdown_timeout` (10 s), kills the trainer if needed, and commits.
-- **Hashes survive.** Each node syncs changed hash files to the run every
-  30 s, so background commits keep them even if the final commit doesn't
-  finish. Every attempt hashes into its own time-ordered namespace
-  (`<launch_id>.a<time>-<hex>`),
-  and files are split every 1000 steps so syncs stay small.
-- **Every node resumes from the same checkpoint.** Node 0 sets aside
-  incomplete checkpoints (a DCP checkpoint counts only if every shard its
-  `.metadata` lists is present at full length) and commits; the other nodes
-  reload and confirm they see the same latest checkpoint before any trainer
-  starts.
-- **Data settings can't change under a run.** `run.json` records the seed and
-  the data contract's settings; a resume with different ones is refused.
-  Anything else (trainer flags, this library) may change between launches.
-
-A stopped run loses the steps since its last checkpoint. Saving on the way
-out doesn't fit: the save and its commit must finish within the grace
-period, and Qwen3-0.6B with optimizer state (~8 GB) took 37 s on 4 H100s.
-
-### Rehearsing preemptions
-
-`stop-after` stops a run's container the way a preemption would, to rehearse
-a long run before trusting it:
-
-```bash
-uv run python -m zephon_modal stop-after path/to/job.py --run-id <run> --after 40 120 [--timeout SECONDS]
-```
-
-It polls every 10 s: checkpoints on the runs Volume, and attempt records in
-the job's registry (the reconciler only looks every few minutes). Once the
-first checkpoint at or past each step in `--after` is on the Volume with its
-DCP `.metadata`, it waits 20 s for the rest of the save (other nodes'
-shards) and runs `modal container stop` on the current launch's node-0
-container. It does that only while that attempt's record says it's
-`running`, and only once the checkpoint is past the one the attempt resumed
-from, so every placement trains before it's stopped. On a cluster, stopping
-node 0 stops every node. It exits nonzero if the run stops being active
-before every step was reached, or at `--timeout` (3 hours by default).
-Under `start --max-restarts 0`, every stop becomes a move to the next
-placement.
-
-These are injected stops, not real preemptions: Modal sends the same SIGINT
-and restarts the input the same way, but how often real preemptions happen
-is unknown.
-
-## Verification
-
-Hashing is optional, and chosen by the recipe. In torchtitan, use
-`SampleHashingZephonDataLoader` instead of Zephon's plain loader; in Megatron,
-pass `entry="zephon_modal.zephon.megatron_entry"`. Without them nothing is
-hashed, and the runner's periodic sync only refreshes its heartbeat. Hashing
-costs milliseconds of CPU per step and a few kilobytes per step on the
-Volume, but it sits in the data path: it rejects batches it can't hash (extra
-`model_kwargs`, for now), so turn it on deliberately.
-
-Two checks use the hashes:
+- **`replays`** needs no reference. Every resume re-trains the steps since the
+  last checkpoint, often at a different DP degree, and those steps must match
+  their first training. A long run collects this evidence at every resize for
+  free.
+- **`compare`** checks a run against a reference run, such as a short one
+  made with `launch`. With `--steps N` it's strict: every step up to `N` must
+  be present in both runs, from every DP rank, and match.
 
 ```bash
 uv run python -m zephon_modal replays path/to/job.py --run-id <run>
 uv run python -m zephon_modal compare path/to/job.py --reference <ref> --candidate <run> --steps 200 --rows-per-step 128
 ```
 
-- **`replays`** checks a run against itself, with no reference run. Every
-  resume re-trains the steps since the last checkpoint, often at a different
-  DP degree, so those steps are hashed by both attempts and must match. A
-  long run collects this evidence at every resize for free. A step an
-  attempt was cut off in the middle of is skipped.
-- **`compare`** checks a run against a reference run. With `--steps` it's
-  strict: every step in the range must be present in both runs, from every
-  DP rank, with the expected row count, and match. Without it, it compares
-  the steps both runs have.
+Hashing is optional and sits in the data path, so it's a deliberate choice;
+[docs/design.md](docs/design.md#sample-hashes) covers what it does and doesn't
+cover.
 
-Under tensor or context parallelism, every rank sharing a DP rank records
-the same rows; each DP rank counts once, and only if its copies agree.
-Hashes cover the batches the loader handed the trainer, not completed
-optimizer updates.
+## What's been tested
 
-## Smoke test
-
-`examples/smoke` exercises the whole path with a fake trainer on T4s (a few
-cents). Set a prefix: deployed app names are shared across the workspace.
-
-```bash
-export ZEPHON_MODAL_SMOKE_PREFIX=<you>-smoke ZEPHON_MODAL_SMOKE_VOLUME=<you>-smoke-runs
-uv run python -m zephon_modal launch examples/smoke/job.py --run-id <you>-ref --steps 40 --placement t4x1
-uv run python -m zephon_modal start examples/smoke/job.py:preempt --run-id <you>-run --steps 40
-uv run python -m zephon_modal status examples/smoke/job.py:preempt --run-id <you>-run
-modal container stop <task>   # from `status`, once it has a checkpoint
-uv run python -m zephon_modal compare examples/smoke/job.py --reference <you>-ref --candidate <you>-run --steps 40
-modal app stop <you>-smoke-preempt
-```
-
-Expected: Modal restarts the launch, the reconciler records the restart, the
-run finishes, and `compare` reports 40/40. `short_timeout` ends every launch
-after two minutes, as a long run's launches end at 24 hours.
-
-## torchtitan example
-
-`examples/torchtitan` is a runnable Qwen3-0.6B job on H100s: a 2-node
-H100:8 cluster and one H100:8-or-H100:4 node, torchtitan-zephon cloned at a
-pinned commit, and FineWeb-Edu staged once into a Volume. Its README covers
-staging, starting, comparing and rehearsing a run.
-
-## Before a long run
-
-Exercised live with the reconciler, on T4s: a stopped container restarted by
-Modal and followed to completion; a launch ending at the function timeout,
+**Exercised live, on T4s with the reconciler:** a stopped container restarted
+by Modal and followed to completion; a launch ending at the function timeout,
 draining and relaunching; `stop`, then `start` again resuming; checkpoint
 pruning; and failed launches retried, then given up on, each after draining.
-On H100s (in zephon-modal-demo): torchtitan moving from a 2-node cluster
-(DP 16) to one node (DP 8) after a stop, and Megatron restarting in place on
-a 2-node cluster. Every one matched a reference run under the strict
-comparison, and `replays` matched across the resize.
 
-Not yet exercised: a queue timeout under the reconciler (Modal allocated
+**On H100s:** torchtitan moving from a 2-node cluster (DP 16) to one node
+(DP 8) after a stop, and Megatron restarting in place on a 2-node cluster.
+
+Every one matched a reference run under the strict `compare`, and `replays`
+matched across the resize.
+
+**Not yet exercised:** a queue timeout under the reconciler (Modal allocated
 every time), moving to another placement after a failure, the alert webhook,
-`recover`, a real preemption (all were `modal container stop`), and anything
-longer than a day. Rehearse a long run on T4s, then on the real shape, first.
+`recover`, a real preemption (every stop so far was `modal container stop`),
+and anything longer than a day. Before a long run, rehearse it with
+`stop-after` on T4s, then on the real shape.
+
+## Development
+
+```bash
+uv sync --group dev
+uv run pytest
+uv run ruff format . && uv run ruff check .
+uv run pyright
+```
+
+The tests don't touch Modal. Only `zephon_modal/zephon/torchtitan.py` and
+`megatron_entry.py` import training frameworks, and only inside training
+images; the rest of the package imports without torch.
+
+Apache-2.0.

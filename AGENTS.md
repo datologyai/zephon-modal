@@ -1,6 +1,7 @@
 # Agent notes
 
-Start with README.md: concepts, commands, smoke test and roadmap.
+Start with README.md (concepts, smoke test, commands, what's been tested),
+then docs/design.md (the reconciler, preemption and sample hashes).
 
 - `make`-free for now: `uv sync --group dev`, then `uv run pytest`,
   `uv run ruff format . && uv run ruff check .`, `uv run pyright`.

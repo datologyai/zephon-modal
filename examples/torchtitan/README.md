@@ -112,4 +112,4 @@ uv run python -m zephon_modal compare examples/torchtitan/job.py --reference <yo
 uv run python -m zephon_modal replays examples/torchtitan/job.py --run-id <you>-rehearsal
 ```
 
-These are injected stops, not real preemptions; see the main README.
+These are injected stops, not real preemptions; see [docs/design.md](../../docs/design.md#rehearsing-preemptions-with-stop-after).
