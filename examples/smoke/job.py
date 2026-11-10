@@ -30,11 +30,9 @@ class FakeTrainer(Adapter):
 
     Attributes:
         step_seconds: Sleep per step, to leave time to stop a container mid-run.
-        checkpoint_on_shutdown: Save at the end of the current step when stopped.
     """
 
     step_seconds: float = 0.0
-    checkpoint_on_shutdown: bool = False
     checkpoints: CheckpointLayout | None = CheckpointLayout()
 
     def workdir(self) -> str:
@@ -44,10 +42,7 @@ class FakeTrainer(Adapter):
         return ["fake_trainer.py"]
 
     def env(self, ctx: LaunchContext) -> dict[str, str]:
-        return {
-            "FAKE_TRAINER_STEP_SECONDS": str(self.step_seconds),
-            "FAKE_TRAINER_CHECKPOINT_ON_SHUTDOWN": "1" if self.checkpoint_on_shutdown else "0",
-        }
+        return {"FAKE_TRAINER_STEP_SECONDS": str(self.step_seconds)}
 
 
 image = (
@@ -83,12 +78,8 @@ def smoke_job(
 PREFIX = os.environ.get("ZEPHON_MODAL_SMOKE_PREFIX", "zephon-modal-smoke")
 job = smoke_job(PREFIX, FakeTrainer())
 # Slow steps, so a container can be stopped mid-run (`modal container stop`)
-# to rehearse a preemption. `preempt` exits without saving; `preempt_save`
-# saves on the way out.
+# to rehearse a preemption; it resumes from its last periodic checkpoint.
 preempt = smoke_job(f"{PREFIX}-preempt", FakeTrainer(step_seconds=3.0), timeout=20 * 60)
-preempt_save = smoke_job(
-    f"{PREFIX}-preempt-save", FakeTrainer(step_seconds=3.0, checkpoint_on_shutdown=True), timeout=20 * 60
-)
 # Launches end at Modal's function timeout after two minutes, as a day-long
 # run's do at 24 hours; the reconciler relaunches them and they resume.
 short_timeout = smoke_job(f"{PREFIX}-timeout", FakeTrainer(step_seconds=3.0), timeout=120)

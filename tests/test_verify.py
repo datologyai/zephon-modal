@@ -39,6 +39,7 @@ def _train(run_dir, launch_id: str, dp: int, steps: range, microbatch_order=lamb
             dp_world_size=dp,
             dp_rank=rank,
             microbatches_per_step=MICROBATCHES_PER_STEP,
+            schema="test-v1",
             consumed_microbatches=steps.start * MICROBATCHES_PER_STEP,
         )
         for rank in range(dp)
@@ -77,7 +78,12 @@ def test_latest_launch_wins_for_retrained_steps(tmp_path):
 def test_mid_step_restore_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="mid-step"):
         StepHashRecorder(
-            str(tmp_path / "h.jsonl"), dp_world_size=2, dp_rank=0, microbatches_per_step=8, consumed_microbatches=3
+            str(tmp_path / "h.jsonl"),
+            dp_world_size=2,
+            dp_rank=0,
+            microbatches_per_step=8,
+            schema="test-v1",
+            consumed_microbatches=3,
         )
 
 
@@ -227,3 +233,14 @@ def test_a_partial_step_from_a_stopped_attempt_is_skipped(tmp_path):
     _train(run, "20261109T000000.a0002", dp=2, steps=range(2, 3))
     assert check_replays(str(run)) == []
     assert format_replays([]) == "No replayed steps yet"
+
+
+def test_records_without_a_schema_are_never_comparable(tmp_path):
+    for run in ("ref", "cand"):
+        hash_dir = tmp_path / run / "sample-hashes"
+        hash_dir.mkdir(parents=True)
+        (hash_dir / "20261008T000000-dp1-rank000.jsonl").write_text(
+            json.dumps({"step": 1, "dp": 1, "dp_rank": 0, "row_hashes": ["ab"]}) + "\n"
+        )
+    (row,) = compare_runs(str(tmp_path / "ref"), str(tmp_path / "cand"))
+    assert row["status"] == "incomplete evidence"

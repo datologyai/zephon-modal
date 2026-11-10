@@ -9,10 +9,8 @@ config so ``zephon_modal compare`` can check the run.
 
 from __future__ import annotations
 
-import logging
 import os
 import pickle
-import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -25,11 +23,7 @@ from zephon_modal.context import context
 from zephon_modal.verify.hashes import StepHashRecorder, hash_file_name, pack_fields
 from zephon_modal.zephon import validate_step_size
 
-logger = logging.getLogger(__name__)
-
 CONSUMED_MICROBATCHES_KEY = "zephon_modal_consumed_microbatches"
-# Checkpoints written by zephon-modal-demo, before this package existed.
-LEGACY_CONSUMED_MICROBATCHES_KEY = "demo_consumed_microbatches"
 
 
 class SampleHashingZephonDataLoader(ZephonDataLoader):
@@ -51,7 +45,6 @@ class SampleHashingZephonDataLoader(ZephonDataLoader):
         )
         ctx = context()
         global_rank = dist.get_rank() if dist.is_initialized() else 0
-        self._dp_rank = dp_rank
         self._seq_len = max_context_length
         self._hashes = StepHashRecorder(
             os.path.join(ctx.sample_hash_dir, hash_file_name(ctx.launch_id, dp_world_size, global_rank)),
@@ -62,18 +55,7 @@ class SampleHashingZephonDataLoader(ZephonDataLoader):
         )
 
     def __iter__(self) -> Iterator[TokenizedTrainingMicrobatch]:
-        # Startup latency diagnosis: how long Zephon takes to hand over its
-        # first microbatch, separately from torch.compile and CUDA graph setup.
-        iter_start = time.perf_counter()
-        first_microbatch = True
         for microbatch in super().__iter__():
-            if first_microbatch:
-                first_microbatch = False
-                logger.warning(
-                    "[zephon_modal] dp_rank %d: first Zephon microbatch after %.1fs",
-                    self._dp_rank,
-                    time.perf_counter() - iter_start,
-                )
             fields = {
                 "input": microbatch.input,
                 "labels": microbatch.labels,
@@ -96,5 +78,4 @@ class SampleHashingZephonDataLoader(ZephonDataLoader):
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         super().load_state_dict(state_dict)
-        key = CONSUMED_MICROBATCHES_KEY if CONSUMED_MICROBATCHES_KEY in state_dict else LEGACY_CONSUMED_MICROBATCHES_KEY
-        self._hashes.consumed_microbatches = pickle.loads(state_dict[key])
+        self._hashes.consumed_microbatches = pickle.loads(state_dict[CONSUMED_MICROBATCHES_KEY])

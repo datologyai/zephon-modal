@@ -35,7 +35,7 @@ class LaunchContext:
         node_rank: This node's rank.
         nproc_per_node: Trainer processes (GPUs) per node.
         sample_hash_dir: Node-local directory for per-step sample hashes,
-            copied into ``run_dir`` when the launch ends.
+            copied into ``run_dir`` every 30 seconds.
         data: Settings from the job's :class:`~zephon_modal.data.DataContract`
             (for Zephon, read them with :func:`zephon_modal.zephon.settings`).
     """
@@ -55,16 +55,6 @@ class LaunchContext:
     @property
     def world_size(self) -> int:
         return self.nnodes * self.nproc_per_node
-
-    @property
-    def keep_all_checkpoints(self) -> bool:
-        """Whether the trainer must not purge old checkpoints.
-
-        On a multi-node launch each node only sees its own uncommitted Volume
-        files, so purging old steps from one node leaves the others' shards
-        behind as partial checkpoints.
-        """
-        return self.nnodes > 1
 
     def to_env(self) -> dict[str, str]:
         return {CONTEXT_ENV: json.dumps(asdict(self))}

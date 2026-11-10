@@ -136,17 +136,15 @@ class Observation:
 
     Attributes:
         call: The current launch's call, if there is one.
-        task_id: The running attempt's node-0 container.
         error: Why the call failed or couldn't be observed.
         drained: Every container the current launch started has recorded its final commit.
         checkpoint: The latest complete checkpoint's step.
         gpu_hours: GPU hours across every attempt of the run so far.
-        attempts: Attempts the current launch has started, from its containers'
-            own records, so a restart that came and went between ticks still counts.
+        attempts: Attempts the current launch has started (node 0's records),
+            so a restart that came and went between ticks still counts.
     """
 
     call: Call | None = None
-    task_id: str | None = None
     error: str | None = None
     drained: bool = True
     checkpoint: int | None = None
@@ -251,7 +249,6 @@ def _launch(plan: Plan, state: RunState, backend: Backend, now: float) -> None:
         "spawned": now,
         "queued_since": now,
         "running_since": None,
-        "tasks": [],
     }
     backend.save(state)
     try:
@@ -408,12 +405,9 @@ def tick(
     elif call is Call.RUNNING:
         current.pop("unknown_since", None)
         current["queued_since"] = None
-        new_task = observation.task_id not in current["tasks"]
-        if new_task:
-            current["tasks"].append(observation.task_id)
-        # Ticks are minutes apart, so count attempts from the containers' records
-        # (a restart can start and end between ticks), or from the tasks seen.
-        attempts = max(observation.attempts, len(current["tasks"]))
+        # Ticks are minutes apart, so attempts come from the containers' records:
+        # a restart can start and end between ticks.
+        attempts = observation.attempts
         if attempts > current.get("attempts", 0):
             current["attempts"] = attempts
             current["running_since"] = now
@@ -512,14 +506,13 @@ class ModalBackend(Backend):
         layout = spec.adapter.checkpoints
         checkpoint = layout.latest_complete(spec.run_dir) if layout is not None else None
         current = state.current
-        # Attempt records come from the registry: each container's own, atomically
-        # updated entry. ("ended" is published only after its last commit returned.)
-        hours = gpu_hours(
-            self.registry.run_records(plan.run_id), time.time(), current["launch_id"] if current else None
-        )
+        # Each container's own, atomically updated record; "ended" is published
+        # only after its last commit returned.
+        run_records = self.registry.run_records(plan.run_id)
+        hours = gpu_hours(run_records, time.time(), current["launch_id"] if current else None)
         if current is None:
             return Observation(checkpoint=checkpoint, gpu_hours=hours)
-        records = self.registry.launch_records(plan.run_id, current["launch_id"])
+        records = [record for record in run_records if record["launch_id"] == current["launch_id"]]
         drained = all("ended" in record for record in records)
         call, error = observe_call(modal.FunctionCall.from_id(current["call_id"]))
         if call is not None:
@@ -536,12 +529,7 @@ class ModalBackend(Backend):
                 call=Call.UNKNOWN, error="no heartbeat", drained=drained, checkpoint=checkpoint, gpu_hours=hours
             )
         return Observation(
-            call=Call.RUNNING,
-            task_id=latest["task_id"],
-            drained=drained,
-            checkpoint=checkpoint,
-            gpu_hours=hours,
-            attempts=len(attempts),
+            call=Call.RUNNING, drained=drained, checkpoint=checkpoint, gpu_hours=hours, attempts=len(attempts)
         )
 
     def spawn(self, spec: RunSpec) -> str:

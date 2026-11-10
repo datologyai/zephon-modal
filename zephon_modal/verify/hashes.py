@@ -46,7 +46,7 @@ def hash_file_name(launch_id: str, dp_world_size: int, global_rank: int) -> str:
 def segment_path(path: str, step: int) -> str:
     """The file holding ``step``'s record: ``path`` split every :data:`SEGMENT_STEPS` steps.
 
-    The runner copies changed hash files to the Volume every few seconds by
+    The runner copies changed hash files to the Volume every 30 seconds by
     rewriting them, so a multi-day launch keeps each rewrite small.
     """
     stem, extension = os.path.splitext(path)
@@ -67,8 +67,8 @@ class StepHashRecorder:
         dp_world_size: int,
         dp_rank: int,
         microbatches_per_step: int,
+        schema: str,
         consumed_microbatches: int = 0,
-        schema: str = "tokens-v1",
     ) -> None:
         if dp_world_size < 1 or microbatches_per_step < 1 or not 0 <= dp_rank < dp_world_size:
             raise ValueError("DP size and step size must be positive, with a valid DP rank")

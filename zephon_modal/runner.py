@@ -10,11 +10,11 @@ launch-specific arrives as a :class:`RunSpec`.
 
 A launch is one Modal call. Modal restarts a preempted call on new
 containers, so a launch has one or more *attempts*; every node of a cluster
-belongs to the same attempt. Each container publishes an attempt record to
-the job's registry (a Modal Dict), which the reconciler decides from:
-written when it starts, refreshed every :data:`SYNC_SECONDS`, and marked
-``ended`` only after its last Volume commit has returned. A copy goes to
-``launches/<launch_id>/<task_id>.json`` on the Volume as the run's history.
+belongs to the same attempt. When the reconciler runs the launch, each
+container publishes an attempt record to the job's registry (a Modal Dict),
+which the reconciler decides from: written when it starts, refreshed every
+:data:`SYNC_SECONDS`, and marked ``ended`` only after its last Volume commit
+has returned.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -49,7 +49,6 @@ RENDEZVOUS_PORT = 29500
 LOCAL_SAMPLE_HASH_DIR = "/tmp/zephon-modal/sample-hashes"
 SYNC_SECONDS = 30.0
 CHECKPOINT_SUBDIR = "checkpoint"
-LAUNCHES_SUBDIR = "launches"
 MANIFEST_FILE = "run.json"
 
 
@@ -61,8 +60,9 @@ class RunSpec:
         registry_name: The job's run registry, when the reconciler started
             this launch. Node 0 checks that the launch is still the run's
             current one before touching the run directory.
-        attempt_tag: Set by the launch itself: a fresh suffix per attempt,
-            shared by every node, so restarts never mix their sample hashes.
+        attempt_tag: Set by the launch itself: a fresh, time-ordered suffix
+            per attempt, shared by every node, so restarts never mix their
+            sample hashes and the latest attempt's sort last.
     """
 
     run_id: str
@@ -192,47 +192,17 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _launch_dir(run_dir: str, launch_id: str) -> str:
-    return f"{run_dir}/{LAUNCHES_SUBDIR}/{launch_id}"
-
-
-# The heartbeat thread and the main thread both write records and hash files.
-_write_lock = threading.RLock()
+# The heartbeat thread and the main thread both sync hash files.
+_write_lock = threading.Lock()
 
 
 def _write_atomically(path: str, content: str) -> None:
-    """Replace ``path`` in one rename, so this container never sees half a file.
-
-    Other containers may still catch a Volume commit half-applied (a renamed
-    file without its contents), which is why the reconciler reads attempt
-    records from the registry, not from these files.
-    """
+    """Replace ``path`` in one rename, so this container never sees half a file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp-{task_id()}"
     with open(tmp_path, "w") as tmp_file:
         tmp_file.write(content)
     os.replace(tmp_path, path)
-
-
-def _write_json(path: str, record: Mapping[str, Any]) -> None:
-    _write_atomically(path, json.dumps(record, indent=2))
-
-
-def _record_launch(spec: RunSpec, ctx: LaunchContext) -> None:
-    """``launches/<launch_id>/launch.json``: what was asked for, and what Modal allocated."""
-    if ctx.node_rank != 0:
-        return
-    record = {
-        "launch_id": spec.launch_id,
-        "placement": asdict(spec.placement) | {"name": spec.placement.name},
-        "allocated": ctx.placement,
-        "world_size": ctx.world_size,
-        "dp": ctx.world_size // spec.adapter.model_parallel_size,
-        "steps": spec.steps,
-        "seed": spec.seed,
-        "data": {"contract": type(spec.data).__qualname__, **spec.data.context()},
-    }
-    _write_json(f"{_launch_dir(spec.run_dir, spec.launch_id)}/launch.json", record)
 
 
 def _registry(spec: RunSpec) -> Any:
@@ -241,76 +211,29 @@ def _registry(spec: RunSpec) -> Any:
     return Registry.from_name(spec.registry_name) if spec.registry_name else None
 
 
-def record_attempt(spec: RunSpec, ctx: LaunchContext, record: Mapping[str, Any], *, publish: bool = True) -> None:
-    """Write this container's attempt record to the Volume's history, and publish it to the registry.
+def publish_attempt(spec: RunSpec, ctx: LaunchContext, record: Mapping[str, Any], attempts: int = 1) -> None:
+    """Publish this container's attempt record to the job's registry, when the reconciler runs this launch.
 
-    ``publish=False`` writes only the history copy: the final record is
-    published after the last commit, by :func:`publish_attempt`.
+    Retries up to ``attempts`` times, backing off, then raises.
     """
-    full = {"task_id": task_id(), "node_rank": ctx.node_rank, **record}
-    with _write_lock:
-        _write_json(f"{_launch_dir(spec.run_dir, spec.launch_id)}/{task_id()}.json", full)
-    if publish:
-        publish_attempt(spec, full)
-
-
-def publish_attempt(spec: RunSpec, record: Mapping[str, Any], attempts: int = 1) -> None:
-    """Publish an attempt record to the job's registry, when the reconciler runs this launch."""
     registry = _registry(spec)
     if registry is None:
         return
+    full = {"task_id": task_id(), "node_rank": ctx.node_rank, **record}
     for attempt in range(attempts - 1):
-        if _try_publish(registry, spec, record):
+        if _try_publish(registry, spec, full):
             return
         time.sleep(2**attempt)
-    registry.record(spec.run_id, spec.launch_id, task_id(), dict(record))
+    registry.record(spec.run_id, spec.launch_id, task_id(), full)
 
 
-def _try_publish(registry: Any, spec: RunSpec, record: Mapping[str, Any]) -> bool:
+def _try_publish(registry: Any, spec: RunSpec, record: dict[str, Any]) -> bool:
     try:
-        registry.record(spec.run_id, spec.launch_id, task_id(), dict(record))
+        registry.record(spec.run_id, spec.launch_id, task_id(), record)
     except Exception as error:
         print(f"[zephon_modal] couldn't publish the attempt record, retrying: {error!r}", flush=True)
         return False
     return True
-
-
-def launch_records(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
-    """The Volume's history copy of every container's record for one launch, oldest first.
-
-    For launches the reconciler doesn't run (``launch``) and for the record;
-    the reconciler reads the registry. A file caught mid-commit is skipped.
-    """
-    launch_dir = _launch_dir(run_dir, launch_id)
-    if not os.path.isdir(launch_dir):
-        return []
-    records = []
-    for name in os.listdir(launch_dir):
-        if name == "launch.json" or not name.endswith(".json"):
-            continue
-        with open(f"{launch_dir}/{name}") as record_file:
-            try:
-                records.append(json.load(record_file))
-            except ValueError:
-                continue
-    return sorted(records, key=lambda record: record["started"])
-
-
-def launch_attempts(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
-    """Node 0's attempt records for one launch, oldest first: one per attempt."""
-    return [record for record in launch_records(run_dir, launch_id) if record.get("node_rank") == 0]
-
-
-def all_records(run_dir: str) -> list[dict[str, Any]]:
-    """Every attempt record of every launch of the run, each with its ``launch_id``."""
-    launches = f"{run_dir}/{LAUNCHES_SUBDIR}"
-    if not os.path.isdir(launches):
-        return []
-    return [
-        record | {"launch_id": launch_id}
-        for launch_id in sorted(os.listdir(launches))
-        for record in launch_records(run_dir, launch_id)
-    ]
 
 
 def local_hash_dir(spec: RunSpec) -> str:
@@ -336,16 +259,15 @@ def check_manifest(spec: RunSpec) -> None:
         if existing != manifest:
             raise ValueError(f"{spec.run_id} was started with {existing}, not {manifest}; use a new run ID")
         return
-    _write_json(path, manifest)
+    _write_atomically(path, json.dumps(manifest, indent=2))
 
 
 def _check_current(spec: RunSpec) -> None:
     """Refuse to run a launch the reconciler has moved on from."""
-    if spec.registry_name is None:
+    registry = _registry(spec)
+    if registry is None:
         return
-    from zephon_modal.registry import Registry
-
-    state = Registry.from_name(spec.registry_name).state(spec.run_id)
+    state = registry.state(spec.run_id)
     current = getattr(state, "current", None) or {}
     if current.get("launch_id") != spec.launch_id:
         raise RuntimeError(f"Launch {spec.launch_id} is no longer {spec.run_id}'s current launch")
@@ -378,15 +300,9 @@ def bootstrap_attempt(spec: RunSpec, topology: NodeTopology) -> tuple[RunSpec, d
         volume.reload()
         _check_current(spec)
         check_manifest(spec)
-        registry = _registry(spec)
-        if registry is not None:
-            previous = [r for r in registry.launch_records(spec.run_id, spec.launch_id) if r.get("node_rank") == 0]
-        else:
-            previous = launch_attempts(spec.run_dir, spec.launch_id)
-        sequence = 1 + max((record.get("attempt_sequence", 0) for record in previous), default=0)
-        # The suffix keeps tags unique even if a lost record repeats a sequence number.
-        tag = f".a{sequence:04d}-{uuid.uuid4().hex[:6]}"
-        state = {"attempt_tag": tag, "attempt_sequence": sequence, **prepare_resume(spec)}
+        # Time-ordered, so a restart's hashes sort after the attempt it replaces.
+        tag = f".a{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}-{uuid.uuid4().hex[:6]}"
+        state = {"attempt_tag": tag, **prepare_resume(spec)}
         volume.commit()
         return state
 
@@ -440,31 +356,18 @@ def _heartbeat(spec: RunSpec, ctx: LaunchContext, attempt: dict[str, Any], done:
 def _beat(spec: RunSpec, ctx: LaunchContext, attempt: dict[str, Any]) -> None:
     try:
         sync_sample_hashes(spec)
-        record_attempt(spec, ctx, dict(attempt) | {"heartbeat": _now()})
+        publish_attempt(spec, ctx, dict(attempt) | {"heartbeat": _now()})
     except Exception as error:
         print(f"[zephon_modal] heartbeat failed, retrying in {SYNC_SECONDS:.0f}s: {error!r}", flush=True)
 
 
-def start_trainer(
-    spec: RunSpec, topology: NodeTopology, extra_env: Mapping[str, str] | None = None
-) -> subprocess.Popen:
-    """Record the launch and start torchrun for this node.
-
-    ``extra_env`` reaches every trainer process (e.g. profiling switches).
-    """
+def start_trainer(spec: RunSpec, topology: NodeTopology) -> subprocess.Popen:
+    """Start torchrun for this node."""
     ctx = launch_context(spec, topology)
     os.makedirs(spec.run_dir, exist_ok=True)
-    _record_launch(spec, ctx)
     # Unbuffered: torchrun sends worker output through files, and buffered
     # output reaches the logs in late chunks, or not at all if the trainer is killed.
-    env = (
-        os.environ
-        | {"PYTHONUNBUFFERED": "1"}
-        | spec.adapter.env(ctx)
-        | _compile_cache_env(spec)
-        | dict(extra_env or {})
-        | ctx.to_env()
-    )
+    env = os.environ | {"PYTHONUNBUFFERED": "1"} | spec.adapter.env(ctx) | _compile_cache_env(spec) | ctx.to_env()
     command = torchrun_command(spec.adapter, ctx, topology)
     print(f"[zephon_modal] {spec.run_id} launch {ctx.launch_id} on {ctx.placement}: {' '.join(command)}")
     # Its own session: Modal's SIGINT goes to the whole process group, and the
@@ -491,17 +394,11 @@ def stop_trainer(trainer: subprocess.Popen, adapter: Adapter) -> int | None:
     return returncode
 
 
-def _commit(volume_name: str) -> None:
-    import modal
-
-    modal.Volume.from_name(volume_name).commit()
-
-
 def finish_launch(spec: RunSpec) -> list[str]:
     """Commit the Volumes; returns the checkpoint directories present."""
     import modal
 
-    _commit(spec.runs_volume_name)
+    modal.Volume.from_name(spec.runs_volume_name).commit()
     if spec.compile_cache_volume_name is not None:
         modal.Volume.from_name(spec.compile_cache_volume_name).commit()
     checkpoint_dir = f"{spec.run_dir}/{CHECKPOINT_SUBDIR}"
@@ -533,12 +430,12 @@ def train_node(spec: RunSpec) -> list[str]:
     heartbeat: threading.Thread | None = None
     try:
         # Before anything touches the run, so the reconciler waits for this container.
-        record_attempt(spec, ctx, attempt)
+        publish_attempt(spec, ctx, attempt)
         spec, resume = bootstrap_attempt(spec, topology)
         ctx = launch_context(spec, topology)
         attempt |= resume | {"outcome": "running"}
         trainer = start_trainer(spec, topology)
-        record_attempt(spec, ctx, attempt)
+        publish_attempt(spec, ctx, attempt)
         heartbeat = threading.Thread(target=_heartbeat, args=(spec, ctx, attempt, done), daemon=True)
         heartbeat.start()
         returncode = trainer.wait()
@@ -570,11 +467,9 @@ def train_node(spec: RunSpec) -> list[str]:
             except Exception as error:
                 # Only a note for the record; the final commit below matters more.
                 print(f"[zephon_modal] couldn't read the latest checkpoint: {error!r}", flush=True)
-        final = attempt | {"ended": _now()}
-        record_attempt(spec, ctx, final, publish=False)
         checkpoints = finish_launch(spec)
         # Only now: "ended" tells the reconciler everything this container wrote is committed.
-        publish_attempt(spec, {"task_id": task_id(), "node_rank": ctx.node_rank, **final}, attempts=4)
+        publish_attempt(spec, ctx, attempt | {"ended": _now()}, attempts=4)
     return checkpoints
 
 

@@ -10,10 +10,9 @@ few steps. The "data" is a pure function of (step, microbatch, seed), which
 is what Zephon guarantees for real data, so `compare` must match across DP
 degrees.
 
-On SIGTERM it stops at the end of the current step, saving first if
-FAKE_TRAINER_CHECKPOINT_ON_SHUTDOWN is set (like Megatron's
---exit-signal-handler). FAKE_TRAINER_STEP_SECONDS slows steps down so a
-container can be stopped mid-run.
+On SIGTERM it stops at the end of the current step without saving.
+FAKE_TRAINER_STEP_SECONDS slows steps down so a container can be stopped
+mid-run.
 """
 
 import os
@@ -63,7 +62,6 @@ def main() -> None:
         signal.signal(sig, _on_signal)
     ctx = context()
     step_seconds = float(os.environ.get("FAKE_TRAINER_STEP_SECONDS", "0"))
-    checkpoint_on_shutdown = os.environ.get("FAKE_TRAINER_CHECKPOINT_ON_SHUTDOWN") == "1"
     dist.init_process_group("gloo")
     rank, dp = dist.get_rank(), dist.get_world_size()
     checkpoint_dir = f"{ctx.run_dir}/checkpoint"
@@ -74,6 +72,7 @@ def main() -> None:
         dp_world_size=dp,
         dp_rank=rank,
         microbatches_per_step=MICROBATCHES_PER_STEP,
+        schema="fake-v1",
         consumed_microbatches=start * MICROBATCHES_PER_STEP,
     )
     print(f"[fake_trainer] rank {rank}/{dp} on {ctx.placement}: resuming at step {start}, training to {ctx.steps}")
@@ -84,7 +83,7 @@ def main() -> None:
         # Every rank must agree to stop at the same step.
         stop = torch.tensor([int(stop_requested)])
         dist.all_reduce(stop, op=dist.ReduceOp.MAX)
-        if (step + 1) % CHECKPOINT_INTERVAL == 0 or (stop.item() and checkpoint_on_shutdown):
+        if (step + 1) % CHECKPOINT_INTERVAL == 0:
             save(checkpoint_dir, step + 1, rank)
             if rank == 0:
                 print(f"[fake_trainer] saved step {step + 1}", flush=True)

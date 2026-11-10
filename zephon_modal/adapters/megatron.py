@@ -28,12 +28,6 @@ class Megatron(Adapter):
             sample hashes, use ``"zephon_modal.zephon.megatron_entry"`` with
             ``script="pretrain_gpt_zephon.py"``.
         megatron_dir: Megatron checkout in the image.
-        checkpoint_on_shutdown: Add ``--exit-signal-handler``, so a stopped
-            run finishes its iteration and saves before exiting. Only for
-            small checkpoints: the save must fit in ``shutdown_timeout`` and
-            leave time to commit it (Qwen3-0.6B with optimizer state, ~8 GB,
-            took 37 s on 4 H100s). A save that doesn't finish is set aside on
-            the next resume.
 
     The default ``checkpoints`` layout assumes ``--save`` is
     ``<run_dir>/checkpoint`` with the ``torch_dist`` format.
@@ -43,7 +37,6 @@ class Megatron(Adapter):
     script: str = "pretrain_gpt.py"
     entry: str | None = None
     megatron_dir: str = "/opt/megatron-lm"
-    checkpoint_on_shutdown: bool = False
     checkpoints: CheckpointLayout | None = CheckpointLayout(
         subdir="checkpoint", step_pattern=r"iter_(\d+)", tracker="latest_checkpointed_iteration.txt"
     )
@@ -52,7 +45,7 @@ class Megatron(Adapter):
         return self.megatron_dir
 
     def command(self, ctx: LaunchContext) -> list[str]:
-        script_args = [*resolve(self.args)(ctx), *(["--exit-signal-handler"] if self.checkpoint_on_shutdown else [])]
+        script_args = resolve(self.args)(ctx)
         if self.entry is None:
             return [self.script, *script_args]
         return ["-m", self.entry, self.script, *script_args]
