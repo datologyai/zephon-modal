@@ -1,20 +1,21 @@
 # zephon-modal
 
-**Long training runs on [Modal](https://modal.com) that survive preemption
-and move between GPU shapes.**
+**Elastic, deterministic training runs on [Modal](https://modal.com) with
+[Zephon](https://github.com/datologyai/zephon).**
 
-A multi-day run on Modal will get preempted, will hit Modal's 24-hour function
-limit, and will sometimes find the GPUs it wants unavailable. zephon-modal
-keeps that run going. You give it one training recipe and a ranked list of GPU
-shapes it may use; it launches the run, resumes it from the latest checkpoint
-after every interruption, and moves it to another shape when it has to.
+**Elastic:** a multi-day run on Modal will get preempted, will hit Modal's
+24-hour function limit, and will sometimes find the GPUs it wants
+unavailable. zephon-modal keeps that run going. You give it one training
+recipe and a ranked list of GPU shapes it may use; it launches the run,
+resumes it from the latest checkpoint after every interruption, and moves it
+to another shape when it has to.
 
-It works with any trainer that runs under torchrun and resumes from its own
-latest checkpoint. Moving between shapes changes the data-parallel (DP)
+**Deterministic:** moving between shapes changes the data-parallel (DP)
 degree, and with most data loaders that changes which samples later steps
-see. If that matters to you, use [Zephon](https://github.com/datologyai/zephon)'s
-loader, which gives the same samples at every step whether the run is on 16
-GPUs or 4.
+train on. With Zephon's loader it doesn't: the run trains on exactly the same
+samples at every step whether it's on 16 GPUs or 4, so an interrupted,
+resized run matches one that ran straight through. You can
+[check that](#checking-a-run) too.
 
 > **Status: early.** Built to carry multi-day torchtitan runs. Rehearsed on
 > T4s and H100s, with injected stops, but not yet run for longer than a day.
@@ -36,16 +37,20 @@ flowchart LR
 - **Placements** are the GPU shapes the run may use, best first, such as a
   2-node H100:8 cluster, then a single node. Each becomes its own Modal
   function.
+- **Zephon** makes resizes deterministic. With `Zephon(canonical_replicas=16)`,
+  the data is split into 16 lanes, and the run can train or resume on any DP
+  degree that divides 16 and still see the same samples at every step.
 - **The reconciler** is a scheduled function in the job's Modal app. Every few
   minutes it checks each run and takes at most one step: launch, relaunch,
   move to the next placement, or give up. Nothing long-lived has to stay up.
-- **An adapter** says how to start your trainer under torchrun. Subclass
-  `Adapter` for any framework (the smoke test's fake trainer takes a few
-  lines). `Torchtitan` and `Megatron` adapters are included, and
-  `examples/torchtitan` puts the first one to work.
-- **The data contract** (optional) says which DP degrees the loader allows.
-  By default, any. With `Zephon(canonical_replicas=16)`, the data is split
-  into 16 lanes and the run can train on any DP degree that divides 16.
+- **An adapter** says how to start your trainer under torchrun. `Torchtitan`
+  and `Megatron` adapters are included, and `examples/torchtitan` puts the
+  first one to work. Subclass `Adapter` for any other framework (the smoke
+  test's fake trainer takes a few lines).
+
+Zephon is optional: leave out `data=` and any torchrun trainer that resumes
+from its own checkpoints gets the elastic half, at any DP degree, without the
+same-samples guarantee.
 
 [docs/design.md](docs/design.md) has the details: every decision the
 reconciler makes, how a preempted run resumes cleanly, and why.
@@ -121,7 +126,7 @@ job = ElasticJob(
     name="qwen3",  # the Modal app name
     image=training_image,  # framework + zephon>=0.2.1 + your recipe modules
     adapter=Torchtitan(module="my_recipes", config="qwen3_0p6b_zephon"),
-    data=Zephon(canonical_replicas=16),  # optional: same samples at any DP degree dividing 16
+    data=Zephon(canonical_replicas=16),  # same samples at any DP degree dividing 16
     placements=[
         Placement("H100:8", nodes=2),  # preferred: 2 nodes, DP 16
         Placement("H100:8", fallbacks=("H100:4",)),  # then one node, DP 8 or 4
