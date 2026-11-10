@@ -79,7 +79,7 @@ def _install_sample_hashing() -> None:
         # Prefer the current runtime state, including iteration zero. Older
         # Megatron versions keep restored progress in the CLI namespace.
         get_train_state = getattr(training, "get_train_state", None)
-        train_state = get_train_state() if callable(get_train_state) else None
+        train_state: Any = get_train_state() if callable(get_train_state) else None
         iteration = train_state.iteration if train_state is not None else training.get_args().iteration
         hashes = StepHashRecorder(
             os.path.join(ctx.sample_hash_dir, hash_file_name(ctx.launch_id, dp_world_size, dist.get_rank())),
