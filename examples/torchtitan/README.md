@@ -24,7 +24,7 @@ workspace: prefix them with your name.
 | `ZEPHON_MODAL_TORCHTITAN_DATA_VOLUME` | `zephon-modal-torchtitan-data` | Staged data |
 | `ZEPHON_MODAL_TORCHTITAN_RUNS_VOLUME` | `zephon-modal-torchtitan-runs` | Checkpoints, hashes, run state |
 | `ZEPHON_MODAL_TORCHTITAN_COMPILE_CACHE_VOLUME` | `zephon-modal-torchtitan-compile-cache` | torch.compile caches |
-| `ZEPHON_MODAL_TORCHTITAN_COMMIT` | `990bd303f9a5380fb1ca93ed075b03d810c55e13` | torchtitan-zephon commit to build |
+| `ZEPHON_MODAL_TORCHTITAN_COMMIT` | `1fb11e4eaecb852f0ceb1efec46101ef6f05aaeb` | torchtitan-zephon commit to build |
 | `ZEPHON_MODAL_TORCHTITAN_ALERT_SECRET` | unset | Modal secret providing `ZEPHON_MODAL_ALERT_WEBHOOK` |
 
 ```bash
@@ -36,6 +36,10 @@ export ZEPHON_MODAL_TORCHTITAN_COMPILE_CACHE_VOLUME=<you>-tt-compile-cache
 
 Multi-node clusters must be enabled on your Modal workspace for the
 `2xh100x8` placement.
+
+Set `ZEPHON_MODAL_TORCHTITAN_COMMIT` to a full commit SHA to select the
+TorchTitan revision used by the training image. Changing it rebuilds the
+image from that revision and its requirements.
 
 ## Stage the data, once
 

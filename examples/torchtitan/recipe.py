@@ -71,7 +71,16 @@ def _fineweb_edu_dataloader() -> SampleHashingZephonDataLoader.Config:
 def qwen3_0p6b_zephon() -> Trainer.Config:
     """Qwen3-0.6B on a FineWeb-Edu sample, checkpointing every 10 steps."""
     parallelism = ParallelismConfig()
-    model_config = build_model_config("0.6B", seq_len=SEQ_LEN, parallelism=parallelism)
+    # Keep the existing uncapped packed stream when newer TorchTitan defaults to Varlen.
+    model_config = build_model_config("0.6B", seq_len=SEQ_LEN, parallelism=parallelism, attn_backend="flex")
+    training = TrainingConfig(
+        num_tokens_per_microbatch_per_dp_rank=SEQUENCES_PER_MICROBATCH * SEQ_LEN,
+        num_tokens_per_train_step=SEQUENCES_PER_STEP * SEQ_LEN,
+        steps=context().steps,
+    )
+    # Older TorchTitan also stores this on training and requires it to match the model.
+    if hasattr(training, "max_context_length"):
+        training.max_context_length = SEQ_LEN
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(global_vocab_size=decoder_vocab_size(model_config)),
@@ -83,12 +92,7 @@ def qwen3_0p6b_zephon() -> Trainer.Config:
             optimizer=OptimizersContainer.Config(optimizers=[AdamW.Config(pattern=r".*", lr=LR)]),
             lr_scheduler=LRSchedulersContainer.Config(warmup_steps=WARMUP_STEPS),
         ),
-        training=TrainingConfig(
-            num_tokens_per_microbatch_per_dp_rank=SEQUENCES_PER_MICROBATCH * SEQ_LEN,
-            num_tokens_per_train_step=SEQUENCES_PER_STEP * SEQ_LEN,
-            max_context_length=SEQ_LEN,
-            steps=context().steps,
-        ),
+        training=training,
         parallelism=parallelism,
         checkpointer=CheckpointManager.Config(
             interval=CHECKPOINT_INTERVAL,
