@@ -87,6 +87,7 @@ uv run python -m zephon_modal recover path/to/job.py --run-id <you>-run
 uv run python -m zephon_modal launch path/to/job.py --run-id <you>-ref --steps 200 --placement h100x8
 uv run python -m zephon_modal compare path/to/job.py --reference <you>-ref --candidate <you>-run --steps 200
 uv run python -m zephon_modal replays path/to/job.py --run-id <you>-run
+uv run python -m zephon_modal stop-after path/to/job.py --run-id <you>-run --after 40 120
 ```
 
 `start` deploys the job's app and hands the run to the reconciler, which
@@ -194,6 +195,32 @@ A stopped run loses the steps since its last checkpoint. Saving on the way
 out doesn't fit: the save and its commit must finish within the grace
 period, and Qwen3-0.6B with optimizer state (~8 GB) took 37 s on 4 H100s.
 
+### Rehearsing preemptions
+
+`stop-after` stops a run's container the way a preemption would, to rehearse
+a long run before trusting it:
+
+```bash
+uv run python -m zephon_modal stop-after path/to/job.py --run-id <run> --after 40 120 [--timeout SECONDS]
+```
+
+It polls every 10 s: checkpoints on the runs Volume, and attempt records in
+the job's registry (the reconciler only looks every few minutes). Once the
+first checkpoint at or past each step in `--after` is on the Volume with its
+DCP `.metadata`, it waits 20 s for the rest of the save (other nodes'
+shards) and runs `modal container stop` on the current launch's node-0
+container. It does that only while that attempt's record says it's
+`running`, and only once the checkpoint is past the one the attempt resumed
+from, so every placement trains before it's stopped. On a cluster, stopping
+node 0 stops every node. It exits nonzero if the run stops being active
+before every step was reached, or at `--timeout` (3 hours by default).
+Under `start --max-restarts 0`, every stop becomes a move to the next
+placement.
+
+These are injected stops, not real preemptions: Modal sends the same SIGINT
+and restarts the input the same way, but how often real preemptions happen
+is unknown.
+
 ## Verification
 
 Hashing is optional, and chosen by the recipe. In torchtitan, use
@@ -244,6 +271,13 @@ modal app stop <you>-smoke-preempt
 Expected: Modal restarts the launch, the reconciler records the restart, the
 run finishes, and `compare` reports 40/40. `short_timeout` ends every launch
 after two minutes, as a long run's launches end at 24 hours.
+
+## torchtitan example
+
+`examples/torchtitan` is a runnable Qwen3-0.6B job on H100s: a 2-node
+H100:8 cluster and one H100:8-or-H100:4 node, torchtitan-zephon cloned at a
+pinned commit, and FineWeb-Edu staged once into a Volume. Its README covers
+staging, starting, comparing and rehearsing a run.
 
 ## Before a long run
 

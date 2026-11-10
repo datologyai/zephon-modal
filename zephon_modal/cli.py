@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -179,6 +180,107 @@ def _compare(args: argparse.Namespace) -> int:
     return 0 if identical(rows, strict=args.steps is not None) else 1
 
 
+STOP_AFTER_POLL_SECONDS = 10
+# After a checkpoint appears, give its save (every node's shards) time to finish first.
+STOP_AFTER_SETTLE_SECONDS = 20
+# What `ElasticJob.status` reports for a run that may still train.
+ACTIVE_STATUSES = ("start requested", "running", "draining", "needs recovery")
+
+
+def running_attempt(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    """The latest node-0 attempt record among one launch's ``records`` whose container hasn't recorded an end."""
+    running = [record for record in records if record.get("node_rank") == 0 and "ended" not in record]
+    return max(running, key=lambda record: record["started"]) if running else None
+
+
+def should_stop(pending: Sequence[int], checkpoint: int | None, attempt: Mapping[str, Any] | None) -> bool:
+    """Whether ``stop-after`` should stop ``attempt``'s container now.
+
+    Args:
+        pending: Checkpoint steps not yet stopped after.
+        checkpoint: The run's latest complete checkpoint, if any.
+        attempt: The current launch's running node-0 attempt record (see :func:`running_attempt`).
+
+    Returns:
+        True once the attempt is training (its first record predates knowing
+        where it resumed), has saved a checkpoint past the one it resumed
+        from, so every placement trains before it's stopped, and that
+        checkpoint is at or past the earliest pending step.
+    """
+    if not pending or checkpoint is None or attempt is None or attempt.get("outcome") != "running":
+        return False
+    return checkpoint > (attempt.get("resume_from") or 0) and checkpoint >= min(pending)
+
+
+def latest_complete_checkpoint(job: ElasticJob, run_id: str) -> int | None:
+    """The run's newest checkpoint on the runs Volume (committed view) whose DCP ``.metadata`` has been written."""
+    import re
+
+    import modal
+
+    layout = job.adapter.checkpoints
+    assert layout is not None
+    try:
+        entries = job.runs_volume.listdir(f"{run_id}/{layout.subdir}")
+    except (FileNotFoundError, modal.exception.NotFoundError):
+        return None
+    steps = {
+        int(match.group(1)): entry.path
+        for entry in entries
+        if (match := re.fullmatch(layout.step_pattern, entry.path.rsplit("/", 1)[-1]))
+    }
+    for step in sorted(steps, reverse=True):
+        try:
+            names = {entry.path.rsplit("/", 1)[-1] for entry in job.runs_volume.listdir(steps[step])}
+        except (FileNotFoundError, modal.exception.NotFoundError):
+            continue
+        # DCP writes .metadata after the shards; the settle wait covers other nodes' commits.
+        if ".metadata" in names:
+            return step
+    return None
+
+
+def _stop_after(args: argparse.Namespace) -> int:
+    import subprocess
+    import time
+
+    import modal
+
+    job = load_job(args.job)
+    if job.adapter.checkpoints is None:
+        raise SystemExit(f"{args.job}'s adapter doesn't say where its checkpoints are")
+    registry = job.registry()
+    pending = sorted(set(args.after))
+    deadline = time.monotonic() + args.timeout
+    while pending and time.monotonic() < deadline:
+        try:
+            record = job.status(args.run_id) or {}
+            if record.get("status") not in ACTIVE_STATUSES:
+                print(f"{args.run_id} is {record.get('status') or 'not started'}; {pending} not reached", flush=True)
+                return 1
+            current = record.get("current") or {}
+            checkpoint = latest_complete_checkpoint(job, args.run_id)
+            attempt = running_attempt(registry.launch_records(args.run_id, current["launch_id"])) if current else None
+        except (modal.exception.Error, OSError) as error:
+            # Modal couldn't be asked this time; a long rehearsal shouldn't end over it.
+            print(f"couldn't read {args.run_id}, retrying: {error!r}", flush=True)
+            time.sleep(STOP_AFTER_POLL_SECONDS)
+            continue
+        if attempt is not None and should_stop(pending, checkpoint, attempt):
+            assert checkpoint is not None
+            task = attempt["task_id"]
+            time.sleep(STOP_AFTER_SETTLE_SECONDS)
+            print(f"checkpoint {checkpoint} on {current['placement']}: stopping {task}", flush=True)
+            subprocess.run([sys.executable, "-m", "modal", "container", "stop", "--yes", task], check=False)
+            pending = [step for step in pending if step > checkpoint]
+            continue
+        time.sleep(STOP_AFTER_POLL_SECONDS)
+    if pending:
+        print(f"Timed out with {pending} not reached", flush=True)
+        return 1
+    return 0
+
+
 def register(parser: argparse.ArgumentParser) -> None:
     """Add the subcommands to ``parser``: the ``zephon.cli`` entry point behind ``zephon modal``.
 
@@ -253,6 +355,18 @@ def register(parser: argparse.ArgumentParser) -> None:
         "replays",
         "Check a run against itself: steps re-trained after a resume must match their first training",
         _replays,
+    )
+
+    stop_after = command(
+        "stop-after",
+        "Rehearse preemptions: stop the current launch's container after given checkpoints",
+        _stop_after,
+    )
+    stop_after.add_argument(
+        "--after", type=int, nargs="+", required=True, help="Checkpoint steps to stop after, once each"
+    )
+    stop_after.add_argument(
+        "--timeout", type=float, default=3 * 60 * 60, help="Give up after this many seconds (default: 3 hours)"
     )
 
     compare = commands.add_parser("compare", help="Check two runs trained on the same samples at every step")

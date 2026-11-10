@@ -63,3 +63,47 @@ def test_replays_exit_code_says_whether_replays_match(monkeypatch, capsys):
     assert "1/1 replayed steps identical" in capsys.readouterr().out
     rows[0]["status"] = MISMATCH
     assert cli.main(["replays", "job.py", "--run-id", "r"]) == 1
+
+
+def _attempt(**fields):
+    return {"task_id": "ta-1", "node_rank": 0, "started": "2026-11-09T00:00:00+00:00", "outcome": "running"} | fields
+
+
+def test_should_stop_once_a_running_attempt_checkpoints_at_or_past_a_pending_step():
+    attempt = _attempt(resume_from=None)
+    assert not cli.should_stop([40, 120], 30, attempt)
+    assert cli.should_stop([40, 120], 40, attempt)
+    assert cli.should_stop([40, 120], 50, attempt)
+    assert not cli.should_stop([], 50, attempt)
+    assert not cli.should_stop([40], None, attempt)
+
+
+def test_should_stop_waits_until_the_attempt_trains_past_where_it_resumed():
+    # Restarted at 40 after the first stop: checkpoint 40 is the one it resumed from.
+    assert not cli.should_stop([40], 40, _attempt(resume_from=40))
+    assert cli.should_stop([40], 50, _attempt(resume_from=40))
+    # Its first record predates knowing where it resumed.
+    assert not cli.should_stop([40], 50, _attempt(outcome="starting"))
+    assert not cli.should_stop([40], 50, None)
+
+
+def test_should_stop_leaves_ended_attempts_alone():
+    for outcome in ("completed", "failed", "stopped", "cancelled", "superseded"):
+        assert not cli.should_stop([40], 50, _attempt(outcome=outcome, resume_from=0))
+
+
+def test_running_attempt_is_the_latest_node_0_record_without_an_end():
+    first = _attempt(task_id="ta-1", started="2026-11-09T00:00:00+00:00", ended="2026-11-09T00:10:00+00:00")
+    restarted = _attempt(task_id="ta-2", started="2026-11-09T00:11:00+00:00")
+    node_1 = _attempt(task_id="ta-3", node_rank=1, started="2026-11-09T00:12:00+00:00")
+    assert cli.running_attempt([first, restarted, node_1]) == restarted
+    assert cli.running_attempt([first, node_1]) is None
+    assert cli.running_attempt([]) is None
+
+
+def test_stop_after_parses_steps_and_timeout():
+    parser = argparse.ArgumentParser(prog="zephon modal")
+    cli.register(parser)
+    args = parser.parse_args(["stop-after", "job.py", "--run-id", "r", "--after", "40", "120"])
+    assert args.func is cli._stop_after
+    assert (args.run_id, args.after, args.timeout) == ("r", [40, 120], 3 * 60 * 60)
