@@ -1,7 +1,7 @@
 # zephon-modal
 
-**Long training runs on [Modal](https://modal.com) that survive preemption,
-move between GPU shapes, and can prove they trained on the right data.**
+**Long training runs on [Modal](https://modal.com) that survive preemption
+and move between GPU shapes.**
 
 A multi-day run on Modal will get preempted, will hit Modal's 24-hour function
 limit, and will sometimes find the GPUs it wants unavailable. zephon-modal
@@ -9,12 +9,12 @@ keeps that run going. You give it one training recipe and a ranked list of GPU
 shapes it may use; it launches the run, resumes it from the latest checkpoint
 after every interruption, and moves it to another shape when it has to.
 
-Moving between shapes changes the data-parallel (DP) degree, and with most
-data loaders that changes which samples each step trains on.
-[Zephon](https://github.com/datologyai/zephon)'s loader doesn't: a run sees
-the same samples at every step whether it's on 16 GPUs or 4. zephon-modal
-hashes every sample a run trains on, so you can check that instead of taking
-it on faith.
+It works with any trainer that runs under torchrun and resumes from its own
+latest checkpoint. Moving between shapes changes the data-parallel (DP)
+degree, and with most data loaders that changes which samples later steps
+see. If that matters to you, use [Zephon](https://github.com/datologyai/zephon)'s
+loader, which gives the same samples at every step whether the run is on 16
+GPUs or 4.
 
 > **Status: early.** Built to carry multi-day torchtitan runs. Rehearsed on
 > T4s and H100s, with injected stops, but not yet run for longer than a day.
@@ -28,7 +28,7 @@ flowchart LR
     Reconciler["Reconciler<br/>(runs every 5 min)"] <-->|plan, state| Registry
     Reconciler -->|launch| P1["Placement 1<br/>2 × H100:8, DP 16"]
     Reconciler -.->|if that can't run| P2["Placement 2<br/>1 × H100:8 or H100:4, DP 8 or 4"]
-    P1 & P2 -->|checkpoints, sample hashes| Volume[("Runs Volume")]
+    P1 & P2 -->|checkpoints| Volume[("Runs Volume")]
 ```
 
 - **A job** is a Python file holding one `ElasticJob`: your training image,
@@ -36,16 +36,16 @@ flowchart LR
 - **Placements** are the GPU shapes the run may use, best first, such as a
   2-node H100:8 cluster, then a single node. Each becomes its own Modal
   function.
-- **Adapters** launch a framework's trainer under torchrun. There are two:
-  `Torchtitan` and `Megatron`.
-- **The data contract** says which DP degrees are allowed. With
-  `Zephon(canonical_replicas=16)`, the data is split into 16 lanes and the run
-  can train on any DP degree that divides 16.
 - **The reconciler** is a scheduled function in the job's Modal app. Every few
   minutes it checks each run and takes at most one step: launch, relaunch,
   move to the next placement, or give up. Nothing long-lived has to stay up.
-- **Sample hashes** are the proof. Each DP rank records a hash of every
-  sequence it trains on, per step. `compare` and `replays` check them.
+- **An adapter** says how to start your trainer under torchrun. Subclass
+  `Adapter` for any framework (the smoke test's fake trainer takes a few
+  lines). `Torchtitan` and `Megatron` adapters are included, and
+  `examples/torchtitan` puts the first one to work.
+- **The data contract** (optional) says which DP degrees the loader allows.
+  By default, any. With `Zephon(canonical_replicas=16)`, the data is split
+  into 16 lanes and the run can train on any DP degree that divides 16.
 
 [docs/design.md](docs/design.md) has the details: every decision the
 reconciler makes, how a preempted run resumes cleanly, and why.
@@ -66,20 +66,14 @@ App and Volume names are shared across a Modal workspace, so prefix yours:
 export ZEPHON_MODAL_SMOKE_PREFIX=<you>-smoke ZEPHON_MODAL_SMOKE_VOLUME=<you>-smoke-runs
 ```
 
-1. Train a 40-step reference run on one T4:
-
-   ```bash
-   uv run python -m zephon_modal launch examples/smoke/job.py --run-id <you>-ref --steps 40 --placement t4x1
-   ```
-
-2. Start the run under test. `start` deploys the app and hands the run to the
+1. Start a 40-step run. `start` deploys the app and hands the run to the
    reconciler:
 
    ```bash
    uv run python -m zephon_modal start examples/smoke/job.py:preempt --run-id <you>-run --steps 40
    ```
 
-3. Watch it with `status`. Once it has a checkpoint, stop its container to
+2. Watch it with `status`. Once it has a checkpoint, stop its container to
    simulate a preemption, using the task ID `status` shows:
 
    ```bash
@@ -87,16 +81,22 @@ export ZEPHON_MODAL_SMOKE_PREFIX=<you>-smoke ZEPHON_MODAL_SMOKE_VOLUME=<you>-smo
    modal container stop <task>
    ```
 
-4. When it finishes, check it trained on the same samples as the reference,
-   then stop the deployed app (it keeps its reconciler schedule until you do):
+   Modal restarts the launch, the reconciler records the restart, and the run
+   resumes from its checkpoint and finishes.
+
+3. Stop the deployed app. It keeps its reconciler schedule until you do:
 
    ```bash
-   uv run python -m zephon_modal compare examples/smoke/job.py --reference <you>-ref --candidate <you>-run --steps 40
    modal app stop <you>-smoke-preempt
    ```
 
-You should see Modal restart the launch, the reconciler record the restart,
-the run finish, and `compare` report 40/40 steps matching.
+To check that the resumed run trained on the same samples as an uninterrupted
+one, train a reference with `launch` and [compare](#checking-a-run) them:
+
+```bash
+uv run python -m zephon_modal launch examples/smoke/job.py --run-id <you>-ref --steps 40 --placement t4x1
+uv run python -m zephon_modal compare examples/smoke/job.py --reference <you>-ref --candidate <you>-run --steps 40
+```
 
 `examples/smoke/job.py` has other variants: `short_timeout` ends every launch
 after two minutes (as a long run's launches end at 24 hours), and `fallback`
@@ -121,7 +121,7 @@ job = ElasticJob(
     name="qwen3",                       # the Modal app name
     image=training_image,               # framework + zephon>=0.2.1 + your recipe modules
     adapter=Torchtitan(module="my_recipes", config="qwen3_0p6b_zephon"),
-    data=Zephon(canonical_replicas=16), # any DP degree dividing 16
+    data=Zephon(canonical_replicas=16), # optional: same samples at any DP degree dividing 16
     placements=[
         Placement("H100:8", nodes=2),                   # preferred: 2 nodes, DP 16
         Placement("H100:8", fallbacks=("H100:4",)),     # then one node, DP 8 or 4
@@ -133,18 +133,21 @@ job = ElasticJob(
 )
 ```
 
-Your recipe needs three changes to run under zephon-modal:
+For another framework, pass your own `Adapter` subclass: it returns the
+torchrun command and environment for a launch (see
+[examples/smoke/job.py](examples/smoke/job.py)).
 
-1. **Read the launch from zephon-modal.** Take `run_id` and the step target
-   from `zephon_modal.context()`, and `canonical_replicas` and
-   `aggregate_store` from `zephon_modal.zephon.settings()`.
-2. **Hash samples.** In torchtitan, use `SampleHashingZephonDataLoader.Config`
-   from `zephon_modal.zephon.torchtitan`. For Megatron-LM-zephon, use
-   `Megatron(args="my_recipes:pretrain_args", script="pretrain_gpt_zephon.py",
-   entry="zephon_modal.zephon.megatron_entry")`.
-3. **Keep every checkpoint in the trainer** (torchtitan's `keep_latest_k=0`)
-   and pass `--keep-checkpoints N` to `start` instead. On a multi-node cluster,
-   a trainer that prunes its own checkpoints leaves partial ones behind;
+Your trainer needs to:
+
+1. **Resume by itself** from the latest checkpoint under the run directory,
+   and take its DP degree from the world size.
+2. **Read the launch from zephon-modal**: the run directory, step target and
+   seed come from `zephon_modal.context()`. With Zephon, take
+   `canonical_replicas` and `aggregate_store` from
+   `zephon_modal.zephon.settings()`.
+3. **Keep every checkpoint** (torchtitan's `keep_latest_k=0`) and pass
+   `--keep-checkpoints N` to `start` instead. On a multi-node cluster, a
+   trainer that prunes its own checkpoints leaves partial ones behind;
    [docs/design.md](docs/design.md#preemption) explains why.
 
 Run `placements` on your job file to see each placement's name and the DP
@@ -180,22 +183,26 @@ A deployed app keeps running its reconciler every few minutes until you
 
 ## Checking a run
 
-There are two checks, both built on the sample hashes:
+This is optional, for when you want evidence that a run moving between
+shapes saw the same data it would have otherwise. With Zephon, turn on
+sample hashing: in torchtitan, use `SampleHashingZephonDataLoader.Config` from
+`zephon_modal.zephon.torchtitan`; for Megatron-LM-zephon, pass
+`entry="zephon_modal.zephon.megatron_entry"` to `Megatron`. Each DP rank then
+records a hash of every sequence it trains on, and two commands check them:
 
 - **`replays`** needs no reference. Every resume re-trains the steps since the
   last checkpoint, often at a different DP degree, and those steps must match
-  their first training. A long run collects this evidence at every resize for
-  free.
+  their first training.
 - **`compare`** checks a run against a reference run, such as a short one
-  made with `launch`. With `--steps N` it's strict: every step up to `N` must
-  be present in both runs, from every DP rank, and match.
+  made with `launch`. With `--steps N`, every step up to `N` must be present
+  in both runs, from every DP rank, and match.
 
 ```bash
 uv run python -m zephon_modal replays path/to/job.py --run-id <run>
 uv run python -m zephon_modal compare path/to/job.py --reference <ref> --candidate <run> --steps 200 --rows-per-step 128
 ```
 
-Hashing is optional and sits in the data path, so it's a deliberate choice;
+Hashing sits in the data path, so it's a deliberate choice;
 [docs/design.md](docs/design.md#sample-hashes) covers what it does and doesn't
 cover.
 
