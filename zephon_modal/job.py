@@ -70,6 +70,9 @@ class ElasticJob:
         memory: Memory per node, in MiB.
         timeout: Seconds before Modal stops a launch; the reconciler then
             relaunches it, so this bounds a launch, not a run.
+        reconcile_minutes: How often the reconciler looks at each run.
+            ``start``, ``stop`` and ``recover`` also make it look at once.
+            Keep the policy's timeouts longer than this.
     """
 
     name: str
@@ -82,6 +85,7 @@ class ElasticJob:
     compile_cache_volume: modal.Volume | None = None
     secrets: Sequence[modal.Secret] = ()
     alert_secret: modal.Secret | None = None
+    reconcile_minutes: int = 5
     cpu: float = 32.0
     memory: int = 256 * 1024
     timeout: int = MAX_TIMEOUT
@@ -97,6 +101,8 @@ class ElasticJob:
         names = [placement.name for placement in self.placements]
         if len(set(names)) != len(names):
             raise ValueError(f"Placement names must be unique, got {names}")
+        if not 1 <= self.reconcile_minutes <= 60:
+            raise ValueError(f"reconcile_minutes must be between 1 and 60, got {self.reconcile_minutes}")
         if not MIN_TIMEOUT <= self.timeout <= MAX_TIMEOUT:
             raise ValueError(f"timeout must be between {MIN_TIMEOUT} and {MAX_TIMEOUT} seconds (Modal's limits)")
         _volume_name(self.runs_volume)
@@ -134,7 +140,7 @@ class ElasticJob:
             env={reconcile.CONFIG_ENV: json.dumps(config)},
             volumes={RUNS_MOUNT: self.runs_volume},
             secrets=[self.alert_secret] if self.alert_secret is not None else [],
-            schedule=modal.Period(minutes=1),
+            schedule=modal.Period(minutes=self.reconcile_minutes),
             # One decision-maker: ticks (scheduled, or triggered by the CLI) queue rather than overlap.
             max_containers=1,
             cpu=1.0,
@@ -207,7 +213,7 @@ class ElasticJob:
             self.app.deploy()
 
     def _tick(self) -> None:
-        """Ask the reconciler to look now rather than within the minute."""
+        """Ask the reconciler to look now rather than at its next scheduled tick."""
         modal.Function.from_name(self.name, "reconcile").spawn()
 
     def start(self, run_id: str, steps: int, seed: int = 42, policy: Policy = Policy(), deploy: bool = True) -> None:

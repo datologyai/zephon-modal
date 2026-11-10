@@ -110,11 +110,9 @@ def modal_backend(tmp_path, monkeypatch):
     return backend, plan, calls, tmp_path
 
 
-def _record(tmp_path, launch_id, task_id, **fields):
-    launch_dir = tmp_path / "r1" / "launches" / launch_id
-    launch_dir.mkdir(parents=True, exist_ok=True)
+def _record(backend, launch_id, task_id, **fields):
     record = {"task_id": task_id, "node_rank": 0, "started": _iso(-600), "allocated": "h100x8"} | fields
-    (launch_dir / f"{task_id}.json").write_text(json.dumps(record))
+    backend.registry.record("r1", launch_id, task_id, record)
 
 
 def _state_with_launch(plan, launch_id="L1", call_id="fc-1") -> RunState:
@@ -128,28 +126,29 @@ def test_observe_queued_running_and_silent(modal_backend):
     calls["fc-1"] = None
     state = _state_with_launch(plan)
     assert backend.observe(plan, state).call is Call.QUEUED
-    _record(tmp_path, "L1", "ta-1", heartbeat=_iso(-10))
+    _record(backend, "L1", "ta-1", heartbeat=_iso(-10))
     observation = backend.observe(plan, state)
     assert (observation.call, observation.task_id, observation.drained) == (Call.RUNNING, "ta-1", False)
-    _record(tmp_path, "L1", "ta-1", heartbeat=_iso(-3600))
+    assert observation.attempts == 1
+    _record(backend, "L1", "ta-1", heartbeat=_iso(-3600))
     assert backend.observe(plan, state).call is Call.UNKNOWN
 
 
 def test_observe_a_restart_pending_after_a_preemption(modal_backend):
     backend, plan, calls, tmp_path = modal_backend
     calls["fc-1"] = None
-    _record(tmp_path, "L1", "ta-1", ended=_iso(-5), outcome="stopped")
+    _record(backend, "L1", "ta-1", ended=_iso(-5), outcome="stopped")
     assert backend.observe(plan, _state_with_launch(plan)).call is Call.QUEUED
 
 
 def test_drained_needs_every_container_of_every_node(modal_backend):
     backend, plan, calls, tmp_path = modal_backend
     calls["fc-1"] = RuntimeError("boom")
-    _record(tmp_path, "L1", "ta-1", ended=_iso(-5))
-    _record(tmp_path, "L1", "ta-2", node_rank=1)
+    _record(backend, "L1", "ta-1", ended=_iso(-5))
+    _record(backend, "L1", "ta-2", node_rank=1)
     observation = backend.observe(plan, _state_with_launch(plan))
     assert (observation.call, observation.drained) == (Call.FAILED, False)
-    _record(tmp_path, "L1", "ta-2", node_rank=1, ended=_iso(-1))
+    _record(backend, "L1", "ta-2", node_rank=1, ended=_iso(-1))
     assert backend.observe(plan, _state_with_launch(plan)).drained
 
 
@@ -182,3 +181,13 @@ class _Raises:
 )
 def test_call_outcomes_from_results_end_the_call_but_asking_errors_dont(error, expected):
     assert observe_call(_Raises(error))[0] is expected
+
+
+def test_records_on_the_volume_are_not_what_the_reconciler_reads(modal_backend):
+    backend, plan, calls, tmp_path = modal_backend
+    calls["fc-1"] = None
+    # A history copy on the Volume, but nothing published to the registry yet.
+    launch_dir = tmp_path / "r1" / "launches" / "L1"
+    launch_dir.mkdir(parents=True)
+    (launch_dir / "ta-1.json").write_text(json.dumps({"task_id": "ta-1", "node_rank": 0, "started": _iso(-5)}))
+    assert backend.observe(plan, _state_with_launch(plan)).call is Call.QUEUED

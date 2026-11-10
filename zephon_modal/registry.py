@@ -12,9 +12,15 @@ tuples:
 - ``("state", run_id)``: the :class:`~zephon_modal.reconcile.RunState`.
 - ``("start", run_id)``: a pending start, holding the requested plan.
 - ``("stop", run_id)``, ``("recover", run_id)``: pending requests.
+- ``("attempt", run_id, launch_id, task_id)``: one container's attempt record,
+  written only by that container: when it starts, at every heartbeat, and
+  with ``ended`` once its last Volume commit has returned. These are what
+  the reconciler decides from, so they live here, where a write is atomic
+  and immediately visible, not on the Volume, where a reader can catch a
+  commit half-applied.
 
 Modal expires a Dict entry after seven days with no reads or writes. The
-reconciler reads an active run's plan and writes its state every minute, and
+reconciler reads an active run's plan and writes its state every few minutes, and
 also mirrors the state to the run's directory on the Volume, which is the
 durable record once a finished run's entries expire.
 """
@@ -58,6 +64,31 @@ class Registry:
     def run_ids(self) -> list[str]:
         """Runs with state or a pending start."""
         return sorted({key[1] for key in self.store.keys() if isinstance(key, tuple) and key[0] in ("state", "start")})
+
+    def record(self, run_id: str, launch_id: str, task_id: str, record: dict[str, Any]) -> None:
+        """Publish one container's attempt record (only that container writes it)."""
+        self.store.put(("attempt", run_id, launch_id, task_id), record)
+
+    def _attempt_keys(self, run_id: str) -> list[tuple]:
+        return [
+            key
+            for key in self.store.keys()
+            if isinstance(key, tuple) and len(key) == 4 and key[0] == "attempt" and key[1] == run_id
+        ]
+
+    def launch_records(self, run_id: str, launch_id: str) -> list[dict[str, Any]]:
+        """Every container's attempt record for one launch, all nodes, oldest first."""
+        records = [self.store.get(key) for key in self._attempt_keys(run_id) if key[2] == launch_id]
+        return sorted((record for record in records if record), key=lambda record: record["started"])
+
+    def run_records(self, run_id: str) -> list[dict[str, Any]]:
+        """Every attempt record of every launch of the run, each with its ``launch_id``."""
+        records = []
+        for key in self._attempt_keys(run_id):
+            record = self.store.get(key)
+            if record:
+                records.append(record | {"launch_id": key[2]})
+        return sorted(records, key=lambda record: record["started"])
 
     def pending(self, kind: str, run_id: str) -> Any:
         """A pending request's value, without consuming it."""

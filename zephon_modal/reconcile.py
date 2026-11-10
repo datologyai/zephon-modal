@@ -4,7 +4,8 @@
 """Keeps every started run going until it reaches its step target.
 
 Nothing here runs for long. A deployed job app has a ``reconcile`` function
-that Modal calls every minute (and right after ``start``); it looks at each
+that Modal calls every ``reconcile_minutes`` (5 by default, and right after
+``start``, ``stop`` and ``recover``); it looks at each
 active run once and takes at most one decision, then exits. Modal runs one
 call at a time (``max_containers=1``), so there is a single decision-maker
 without any locking, and there's no long-lived process to outlive Modal's
@@ -43,7 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from zephon_modal.runner import RunSpec, all_records, launch_attempts, launch_records, new_launch_id
+from zephon_modal.runner import RunSpec, new_launch_id
 
 STATE_FILE = "reconciler.json"
 MAX_EVENTS = 500
@@ -81,7 +82,7 @@ class Policy:
     cooldown: float = 30 * 60
     stall_timeout: float = 60 * 60
     max_failures: int = 3
-    drain_timeout: float = 5 * 60
+    drain_timeout: float = 10 * 60
     heartbeat_timeout: float = 5 * 60
     keep_checkpoints: int | None = None
     max_gpu_hours: float | None = None
@@ -140,6 +141,8 @@ class Observation:
         drained: Every container the current launch started has recorded its final commit.
         checkpoint: The latest complete checkpoint's step.
         gpu_hours: GPU hours across every attempt of the run so far.
+        attempts: Attempts the current launch has started, from its containers'
+            own records, so a restart that came and went between ticks still counts.
     """
 
     call: Call | None = None
@@ -148,6 +151,7 @@ class Observation:
     drained: bool = True
     checkpoint: int | None = None
     gpu_hours: float = 0.0
+    attempts: int = 0
 
 
 @dataclass
@@ -271,6 +275,29 @@ def _drain(
     _event(state, now, reason, placement=current.get("placement"), then=then, **detail)
 
 
+def _finish_draining(state: RunState, backend: Backend, now: float) -> bool:
+    """The old launch is gone: do what draining was for. Returns whether to launch next."""
+    assert state.draining is not None
+    then = state.draining["then"]
+    if then == "launch" and state.stop_requested:
+        then = "stop"
+    _event(state, now, "drained", placement=(state.current or {}).get("placement"))
+    state.current, state.draining = None, None
+    state.status = {"launch": "running", "stop": "stopped", "give up": "gave up", "complete": "completed"}[then]
+    if then == "give up":
+        backend.alert(state.run_id, f"{state.run_id}: gave up at checkpoint {state.checkpoint}")
+    if then == "complete":
+        if (state.checkpoint or 0) >= state.steps:
+            backend.alert(state.run_id, f"{state.run_id}: completed {state.steps} steps")
+        else:
+            backend.alert(
+                state.run_id,
+                f"{state.run_id}: the trainer finished, but the latest checkpoint is {state.checkpoint} "
+                f"of {state.steps} steps; check the recipe's step target and save interval",
+            )
+    return then == "launch"
+
+
 def tick(
     plan: Plan, state: RunState, backend: Backend, now: float, *, stop: bool = False, recover: bool = False
 ) -> None:
@@ -311,24 +338,7 @@ def tick(
                     f"within {policy.drain_timeout:.0f}s. Check it's gone, then run `zephon modal recover`.",
                 )
             return
-        then = state.draining["then"]
-        if then == "launch" and state.stop_requested:
-            then = "stop"
-        _event(state, now, "drained", placement=(state.current or {}).get("placement"))
-        state.current, state.draining = None, None
-        state.status = {"launch": "running", "stop": "stopped", "give up": "gave up", "complete": "completed"}[then]
-        if then == "give up":
-            backend.alert(state.run_id, f"{state.run_id}: gave up at checkpoint {state.checkpoint}")
-        if then == "complete":
-            if (state.checkpoint or 0) >= state.steps:
-                backend.alert(state.run_id, f"{state.run_id}: completed {state.steps} steps")
-            else:
-                backend.alert(
-                    state.run_id,
-                    f"{state.run_id}: the trainer finished, but the latest checkpoint is {state.checkpoint} "
-                    f"of {state.steps} steps; check the recipe's step target and save interval",
-                )
-        if then != "launch":
+        if not _finish_draining(state, backend, now):
             return
 
     if state.stop_requested:
@@ -398,10 +408,16 @@ def tick(
     elif call is Call.RUNNING:
         current.pop("unknown_since", None)
         current["queued_since"] = None
-        if observation.task_id not in current["tasks"]:
+        new_task = observation.task_id not in current["tasks"]
+        if new_task:
             current["tasks"].append(observation.task_id)
+        # Ticks are minutes apart, so count attempts from the containers' records
+        # (a restart can start and end between ticks), or from the tasks seen.
+        attempts = max(observation.attempts, len(current["tasks"]))
+        if attempts > current.get("attempts", 0):
+            current["attempts"] = attempts
             current["running_since"] = now
-            restarts = len(current["tasks"]) - 1
+            restarts = attempts - 1
             _event(state, now, "running" if not restarts else "restarted", placement=placement, restarts=restarts)
             if restarts > policy.max_restarts:
                 cool_down()
@@ -410,6 +426,11 @@ def tick(
         current["running_since"] = current.get("running_since") or now
         if now - max(current["running_since"], state.progress_at) >= policy.stall_timeout:
             failed("stalled", f"no new checkpoint in {policy.stall_timeout:.0f}s")
+
+    # A launch that has already ended and confirmed it's gone needn't wait a tick to be replaced.
+    if state.status == "draining" and observation.call in ENDED and observation.drained:
+        if _finish_draining(state, backend, now):
+            _launch(plan, state, backend, now)
 
 
 # --- Modal ---------------------------------------------------------------------------------
@@ -491,17 +512,23 @@ class ModalBackend(Backend):
         layout = spec.adapter.checkpoints
         checkpoint = layout.latest_complete(spec.run_dir) if layout is not None else None
         current = state.current
-        hours = gpu_hours(all_records(spec.run_dir), time.time(), current["launch_id"] if current else None)
+        # Attempt records come from the registry: each container's own, atomically
+        # updated entry. ("ended" is published only after its last commit returned.)
+        hours = gpu_hours(
+            self.registry.run_records(plan.run_id), time.time(), current["launch_id"] if current else None
+        )
         if current is None:
             return Observation(checkpoint=checkpoint, gpu_hours=hours)
-        records = launch_records(spec.run_dir, current["launch_id"])
+        records = self.registry.launch_records(plan.run_id, current["launch_id"])
         drained = all("ended" in record for record in records)
         call, error = observe_call(modal.FunctionCall.from_id(current["call_id"]))
         if call is not None:
             return Observation(call=call, error=error, drained=drained, checkpoint=checkpoint, gpu_hours=hours)
-        attempts = launch_attempts(spec.run_dir, current["launch_id"])
+        attempts = [record for record in records if record.get("node_rank") == 0]
         if not attempts or "ended" in attempts[-1]:
-            return Observation(call=Call.QUEUED, drained=drained, checkpoint=checkpoint, gpu_hours=hours)
+            return Observation(
+                call=Call.QUEUED, drained=drained, checkpoint=checkpoint, gpu_hours=hours, attempts=len(attempts)
+            )
         latest = attempts[-1]
         beat = datetime.fromisoformat(latest.get("heartbeat") or latest["started"]).timestamp()
         if time.time() - beat > plan.policy.heartbeat_timeout:
@@ -509,7 +536,12 @@ class ModalBackend(Backend):
                 call=Call.UNKNOWN, error="no heartbeat", drained=drained, checkpoint=checkpoint, gpu_hours=hours
             )
         return Observation(
-            call=Call.RUNNING, task_id=latest["task_id"], drained=drained, checkpoint=checkpoint, gpu_hours=hours
+            call=Call.RUNNING,
+            task_id=latest["task_id"],
+            drained=drained,
+            checkpoint=checkpoint,
+            gpu_hours=hours,
+            attempts=len(attempts),
         )
 
     def spawn(self, spec: RunSpec) -> str:
