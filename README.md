@@ -133,8 +133,12 @@ Each tick, for each run:
 
 **One writer at a time.** Before any successor launch, the old one must
 *drain*: its call has ended and every container it started has recorded its
-final commit. A container records itself before touching the run, and marks
-itself ended only in its last commit. A launch also checks, before touching
+final commit. Each container publishes an attempt record to the registry
+before touching the run, refreshes it every 30 s, and marks it ended only
+after its last Volume commit has returned. These records live in the Dict,
+not on the Volume: a Dict write is atomic and immediately visible, while a
+reader can catch a Volume commit half-applied (we saw records read back
+empty). A copy goes to `launches/` on the Volume as history. A launch also checks, before touching
 the run, that it is still the run's current launch. If a launch doesn't
 confirm it stopped within 10 minutes, the run waits for an operator: check
 that its containers are gone, then `recover`. A launch that has already

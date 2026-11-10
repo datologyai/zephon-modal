@@ -10,10 +10,11 @@ launch-specific arrives as a :class:`RunSpec`.
 
 A launch is one Modal call. Modal restarts a preempted call on new
 containers, so a launch has one or more *attempts*; every node of a cluster
-belongs to the same attempt. Each container keeps a record under
-``launches/<launch_id>/<task_id>.json`` that the reconciler reads: written
-when it starts, refreshed every :data:`SYNC_SECONDS`, and marked ``ended``
-only in its last commit.
+belongs to the same attempt. Each container publishes an attempt record to
+the job's registry (a Modal Dict), which the reconciler decides from:
+written when it starts, refreshed every :data:`SYNC_SECONDS`, and marked
+``ended`` only after its last Volume commit has returned. A copy goes to
+``launches/<launch_id>/<task_id>.json`` on the Volume as the run's history.
 """
 
 from __future__ import annotations
@@ -200,18 +201,16 @@ _write_lock = threading.RLock()
 
 
 def _write_atomically(path: str, content: str) -> None:
-    """Replace ``path`` in one rename, so a background commit sees the old file or the new one, never half of one.
+    """Replace ``path`` in one rename, so this container never sees half a file.
 
-    The data is flushed to disk before the rename: without that, a background
-    commit could publish the renamed file before its contents, and readers in
-    other containers saw it empty.
+    Other containers may still catch a Volume commit half-applied (a renamed
+    file without its contents), which is why the reconciler reads attempt
+    records from the registry, not from these files.
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp-{task_id()}"
     with open(tmp_path, "w") as tmp_file:
         tmp_file.write(content)
-        tmp_file.flush()
-        os.fsync(tmp_file.fileno())
     os.replace(tmp_path, path)
 
 
@@ -236,26 +235,51 @@ def _record_launch(spec: RunSpec, ctx: LaunchContext) -> None:
     _write_json(f"{_launch_dir(spec.run_dir, spec.launch_id)}/launch.json", record)
 
 
-def record_attempt(spec: RunSpec, ctx: LaunchContext, record: Mapping[str, Any]) -> None:
-    """``launches/<launch_id>/<task_id>.json``: this container's attempt."""
+def _registry(spec: RunSpec) -> Any:
+    from zephon_modal.registry import Registry
+
+    return Registry.from_name(spec.registry_name) if spec.registry_name else None
+
+
+def record_attempt(spec: RunSpec, ctx: LaunchContext, record: Mapping[str, Any], *, publish: bool = True) -> None:
+    """Write this container's attempt record to the Volume's history, and publish it to the registry.
+
+    ``publish=False`` writes only the history copy: the final record is
+    published after the last commit, by :func:`publish_attempt`.
+    """
+    full = {"task_id": task_id(), "node_rank": ctx.node_rank, **record}
     with _write_lock:
-        _write_json(
-            f"{_launch_dir(spec.run_dir, spec.launch_id)}/{task_id()}.json",
-            {"task_id": task_id(), "node_rank": ctx.node_rank, **record},
-        )
+        _write_json(f"{_launch_dir(spec.run_dir, spec.launch_id)}/{task_id()}.json", full)
+    if publish:
+        publish_attempt(spec, full)
 
 
-class UnreadableRecord(Exception):
-    """An attempt record that exists but can't be parsed (seen empty or partial on a Volume)."""
+def publish_attempt(spec: RunSpec, record: Mapping[str, Any], attempts: int = 1) -> None:
+    """Publish an attempt record to the job's registry, when the reconciler runs this launch."""
+    registry = _registry(spec)
+    if registry is None:
+        return
+    for attempt in range(attempts - 1):
+        if _try_publish(registry, spec, record):
+            return
+        time.sleep(2**attempt)
+    registry.record(spec.run_id, spec.launch_id, task_id(), dict(record))
 
 
-def launch_records(run_dir: str, launch_id: str, *, skip_unreadable: bool = False) -> list[dict[str, Any]]:
-    """Every container's attempt record for one launch, all nodes, oldest first.
+def _try_publish(registry: Any, spec: RunSpec, record: Mapping[str, Any]) -> bool:
+    try:
+        registry.record(spec.run_id, spec.launch_id, task_id(), dict(record))
+    except Exception as error:
+        print(f"[zephon_modal] couldn't publish the attempt record, retrying: {error!r}", flush=True)
+        return False
+    return True
 
-    Raises:
-        UnreadableRecord: if a record can't be parsed, unless ``skip_unreadable``.
-            Callers deciding whether a launch is gone must not skip: a record
-            they can't read is a container they can't account for.
+
+def launch_records(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
+    """The Volume's history copy of every container's record for one launch, oldest first.
+
+    For launches the reconciler doesn't run (``launch``) and for the record;
+    the reconciler reads the registry. A file caught mid-commit is skipped.
     """
     launch_dir = _launch_dir(run_dir, launch_id)
     if not os.path.isdir(launch_dir):
@@ -267,9 +291,8 @@ def launch_records(run_dir: str, launch_id: str, *, skip_unreadable: bool = Fals
         with open(f"{launch_dir}/{name}") as record_file:
             try:
                 records.append(json.load(record_file))
-            except ValueError as error:
-                if not skip_unreadable:
-                    raise UnreadableRecord(f"{launch_dir}/{name}") from error
+            except ValueError:
+                continue
     return sorted(records, key=lambda record: record["started"])
 
 
@@ -286,7 +309,7 @@ def all_records(run_dir: str) -> list[dict[str, Any]]:
     return [
         record | {"launch_id": launch_id}
         for launch_id in sorted(os.listdir(launches))
-        for record in launch_records(run_dir, launch_id, skip_unreadable=True)
+        for record in launch_records(run_dir, launch_id)
     ]
 
 
@@ -355,9 +378,15 @@ def bootstrap_attempt(spec: RunSpec, topology: NodeTopology) -> tuple[RunSpec, d
         volume.reload()
         _check_current(spec)
         check_manifest(spec)
-        previous = launch_attempts(spec.run_dir, spec.launch_id)
+        registry = _registry(spec)
+        if registry is not None:
+            previous = [r for r in registry.launch_records(spec.run_id, spec.launch_id) if r.get("node_rank") == 0]
+        else:
+            previous = launch_attempts(spec.run_dir, spec.launch_id)
         sequence = 1 + max((record.get("attempt_sequence", 0) for record in previous), default=0)
-        state = {"attempt_tag": f".a{sequence:04d}", "attempt_sequence": sequence, **prepare_resume(spec)}
+        # The suffix keeps tags unique even if a lost record repeats a sequence number.
+        tag = f".a{sequence:04d}-{uuid.uuid4().hex[:6]}"
+        state = {"attempt_tag": tag, "attempt_sequence": sequence, **prepare_resume(spec)}
         volume.commit()
         return state
 
@@ -503,9 +532,8 @@ def train_node(spec: RunSpec) -> list[str]:
     done = threading.Event()
     heartbeat: threading.Thread | None = None
     try:
-        # Before anything else touches the Volume, so the reconciler waits for this container.
+        # Before anything touches the run, so the reconciler waits for this container.
         record_attempt(spec, ctx, attempt)
-        _commit(spec.runs_volume_name)
         spec, resume = bootstrap_attempt(spec, topology)
         ctx = launch_context(spec, topology)
         attempt |= resume | {"outcome": "running"}
@@ -542,9 +570,11 @@ def train_node(spec: RunSpec) -> list[str]:
             except Exception as error:
                 # Only a note for the record; the final commit below matters more.
                 print(f"[zephon_modal] couldn't read the latest checkpoint: {error!r}", flush=True)
-        # "ended" goes out in the final commit, so the reconciler sees it only once everything else is durable.
-        record_attempt(spec, ctx, attempt | {"ended": _now()})
+        final = attempt | {"ended": _now()}
+        record_attempt(spec, ctx, final, publish=False)
         checkpoints = finish_launch(spec)
+        # Only now: "ended" tells the reconciler everything this container wrote is committed.
+        publish_attempt(spec, {"task_id": task_id(), "node_rank": ctx.node_rank, **final}, attempts=4)
     return checkpoints
 
 

@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from zephon_modal.runner import RunSpec, UnreadableRecord, all_records, launch_attempts, launch_records, new_launch_id
+from zephon_modal.runner import RunSpec, new_launch_id
 
 STATE_FILE = "reconciler.json"
 MAX_EVENTS = 500
@@ -512,21 +512,19 @@ class ModalBackend(Backend):
         layout = spec.adapter.checkpoints
         checkpoint = layout.latest_complete(spec.run_dir) if layout is not None else None
         current = state.current
-        hours = gpu_hours(all_records(spec.run_dir), time.time(), current["launch_id"] if current else None)
+        # Attempt records come from the registry: each container's own, atomically
+        # updated entry. ("ended" is published only after its last commit returned.)
+        hours = gpu_hours(
+            self.registry.run_records(plan.run_id), time.time(), current["launch_id"] if current else None
+        )
         if current is None:
             return Observation(checkpoint=checkpoint, gpu_hours=hours)
-        try:
-            records = launch_records(spec.run_dir, current["launch_id"])
-        except UnreadableRecord as error:
-            # A container we can't account for: never a reason to start a successor.
-            return Observation(
-                call=Call.UNKNOWN, error=f"unreadable {error}", drained=False, checkpoint=checkpoint, gpu_hours=hours
-            )
+        records = self.registry.launch_records(plan.run_id, current["launch_id"])
         drained = all("ended" in record for record in records)
         call, error = observe_call(modal.FunctionCall.from_id(current["call_id"]))
         if call is not None:
             return Observation(call=call, error=error, drained=drained, checkpoint=checkpoint, gpu_hours=hours)
-        attempts = launch_attempts(spec.run_dir, current["launch_id"])
+        attempts = [record for record in records if record.get("node_rank") == 0]
         if not attempts or "ended" in attempts[-1]:
             return Observation(
                 call=Call.QUEUED, drained=drained, checkpoint=checkpoint, gpu_hours=hours, attempts=len(attempts)

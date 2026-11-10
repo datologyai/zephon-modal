@@ -227,20 +227,50 @@ def test_heartbeat_survives_a_failed_write(tmp_path, monkeypatch, capsys):
     assert all("heartbeat" in beat for beat in beats)
 
 
-def test_records_are_flushed_before_the_rename(tmp_path, monkeypatch):
-    synced = []
-    real_fsync = os.fsync
-    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or real_fsync(fd))
-    runner._write_atomically(str(tmp_path / "a" / "record.json"), "{}")
-    assert synced and (tmp_path / "a" / "record.json").read_text() == "{}"
-
-
-def test_an_unreadable_record_is_reported_not_skipped(tmp_path):
+def test_volume_history_skips_a_record_caught_mid_commit(tmp_path):
     launch_dir = tmp_path / "r1" / "launches" / "L1"
     launch_dir.mkdir(parents=True)
     (launch_dir / "ta-1.json").write_text(json.dumps({"task_id": "ta-1", "node_rank": 0, "started": "x"}))
-    (launch_dir / "ta-2.json").write_text("")  # seen empty mid-update
-    with pytest.raises(runner.UnreadableRecord):
-        runner.launch_records(str(tmp_path / "r1"), "L1")
-    assert len(runner.launch_records(str(tmp_path / "r1"), "L1", skip_unreadable=True)) == 1
+    (launch_dir / "ta-2.json").write_text("")
+    assert len(runner.launch_records(str(tmp_path / "r1"), "L1")) == 1
     assert len(runner.all_records(str(tmp_path / "r1"))) == 1
+
+
+class _Store(dict):
+    def put(self, key, value, skip_if_exists=False):
+        self[key] = value
+
+
+def test_records_are_published_to_the_registry_and_the_final_one_only_on_request(tmp_path, monkeypatch):
+    from zephon_modal.registry import Registry
+
+    registry = Registry(_Store())
+    monkeypatch.setattr(runner, "_registry", lambda spec: registry)
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-1")
+    spec = dataclasses.replace(_spec(Placement("H100:4")), runs_mount=str(tmp_path), registry_name="job-runs")
+    ctx = launch_context(spec, NodeTopology(1, 0, None))
+    runner.record_attempt(spec, ctx, {"started": "2026-11-10T00:00:00+00:00", "outcome": "running"})
+    runner.record_attempt(spec, ctx, {"started": "2026-11-10T00:00:00+00:00", "ended": "t"}, publish=False)
+    (record,) = registry.launch_records("r1", spec.launch_id)
+    assert record["outcome"] == "running" and "ended" not in record
+    # The Volume's history copy already has the final record.
+    assert "ended" in runner.launch_records(str(tmp_path / "r1"), spec.launch_id)[0]
+    runner.publish_attempt(
+        spec, {"task_id": "ta-1", "node_rank": 0, "started": "2026-11-10T00:00:00+00:00", "ended": "t"}
+    )
+    assert "ended" in registry.launch_records("r1", spec.launch_id)[0]
+
+
+def test_publishing_retries_then_raises(monkeypatch):
+    calls = []
+
+    class Flaky:
+        def record(self, *args):
+            calls.append(args)
+            raise ConnectionError("Dict unavailable")
+
+    monkeypatch.setattr(runner, "_registry", lambda spec: Flaky())
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: None)
+    with pytest.raises(ConnectionError):
+        runner.publish_attempt(_spec(Placement("H100:4")), {"started": "x"}, attempts=3)
+    assert len(calls) == 3
