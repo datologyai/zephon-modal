@@ -20,7 +20,7 @@ RDMA_APT_PACKAGES = ["libibverbs1", "ibverbs-providers", "rdma-core"]
 # its run_train.sh does. Set ZEPHON_MODAL_TORCHTITAN_COMMIT to try another
 # commit (a full SHA); the clone is rebuilt whenever it changes.
 TORCHTITAN_REPO = "https://github.com/datologyai/torchtitan-zephon"
-TORCHTITAN_COMMIT = os.environ.get("ZEPHON_MODAL_TORCHTITAN_COMMIT", "990bd303f9a5380fb1ca93ed075b03d810c55e13")
+TORCHTITAN_COMMIT = os.environ.get("ZEPHON_MODAL_TORCHTITAN_COMMIT", "1fb11e4eaecb852f0ceb1efec46101ef6f05aaeb")
 TORCHTITAN_DIR = "/opt/torchtitan"
 
 # Zephon from PyPI. Checkpoint aggregation through torchrun's TCPStore
