@@ -40,6 +40,7 @@ dev = [
     "pre-commit>=3.0.0",
     # Checkpoint tests write real DCP checkpoints; containers bring their own torch.
     "torch>=2.6",
+    "numpy>=2.2.6",
 ]
 
 # CPU wheels on Linux (CI): the default Linux torch pulls several GB of CUDA
