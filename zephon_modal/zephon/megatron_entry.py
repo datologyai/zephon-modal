@@ -62,7 +62,7 @@ class SampleHashingIterator:
 def _install_sample_hashing() -> None:
     from megatron.core import mpu
     from megatron.core.num_microbatches_calculator import get_num_microbatches
-    from megatron.training import get_args
+    from megatron.training import get_train_state
     from megatron.training.datasets import zephon_dataloader
 
     zephon_provider = zephon_dataloader.zephon_train_valid_test_datasets_provider
@@ -83,7 +83,7 @@ def _install_sample_hashing() -> None:
             microbatches_per_step=microbatches_per_step,
             # Megatron restores the iteration from its own checkpoint, so the
             # global count needn't live in dataloader state.
-            consumed_microbatches=get_args().iteration * microbatches_per_step,
+            consumed_microbatches=get_train_state().iteration * microbatches_per_step,
             schema="megatron-batch-v2",
         )
         return SampleHashingIterator(loader, hashes), valid, test
