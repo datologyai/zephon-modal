@@ -42,6 +42,16 @@ dev = [
     "torch>=2.6",
 ]
 
+# CPU wheels on Linux (CI): the default Linux torch pulls several GB of CUDA
+# libraries the tests never use. macOS wheels are CPU-only already.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.setuptools.packages.find]
 include = ["zephon_modal*"]
 
