@@ -200,11 +200,18 @@ _write_lock = threading.RLock()
 
 
 def _write_atomically(path: str, content: str) -> None:
-    """Replace ``path`` in one rename, so a background commit sees the old file or the new one, never half of one."""
+    """Replace ``path`` in one rename, so a background commit sees the old file or the new one, never half of one.
+
+    The data is flushed to disk before the rename: without that, a background
+    commit could publish the renamed file before its contents, and readers in
+    other containers saw it empty.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp-{task_id()}"
     with open(tmp_path, "w") as tmp_file:
         tmp_file.write(content)
+        tmp_file.flush()
+        os.fsync(tmp_file.fileno())
     os.replace(tmp_path, path)
 
 
@@ -238,8 +245,18 @@ def record_attempt(spec: RunSpec, ctx: LaunchContext, record: Mapping[str, Any])
         )
 
 
-def launch_records(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
-    """Every container's attempt record for one launch, all nodes, oldest first."""
+class UnreadableRecord(Exception):
+    """An attempt record that exists but can't be parsed (seen empty or partial on a Volume)."""
+
+
+def launch_records(run_dir: str, launch_id: str, *, skip_unreadable: bool = False) -> list[dict[str, Any]]:
+    """Every container's attempt record for one launch, all nodes, oldest first.
+
+    Raises:
+        UnreadableRecord: if a record can't be parsed, unless ``skip_unreadable``.
+            Callers deciding whether a launch is gone must not skip: a record
+            they can't read is a container they can't account for.
+    """
     launch_dir = _launch_dir(run_dir, launch_id)
     if not os.path.isdir(launch_dir):
         return []
@@ -248,7 +265,11 @@ def launch_records(run_dir: str, launch_id: str) -> list[dict[str, Any]]:
         if name == "launch.json" or not name.endswith(".json"):
             continue
         with open(f"{launch_dir}/{name}") as record_file:
-            records.append(json.load(record_file))
+            try:
+                records.append(json.load(record_file))
+            except ValueError as error:
+                if not skip_unreadable:
+                    raise UnreadableRecord(f"{launch_dir}/{name}") from error
     return sorted(records, key=lambda record: record["started"])
 
 
@@ -265,7 +286,7 @@ def all_records(run_dir: str) -> list[dict[str, Any]]:
     return [
         record | {"launch_id": launch_id}
         for launch_id in sorted(os.listdir(launches))
-        for record in launch_records(run_dir, launch_id)
+        for record in launch_records(run_dir, launch_id, skip_unreadable=True)
     ]
 
 

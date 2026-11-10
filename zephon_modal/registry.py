@@ -14,7 +14,7 @@ tuples:
 - ``("stop", run_id)``, ``("recover", run_id)``: pending requests.
 
 Modal expires a Dict entry after seven days with no reads or writes. The
-reconciler reads an active run's plan and writes its state every minute, and
+reconciler reads an active run's plan and writes its state every few minutes, and
 also mirrors the state to the run's directory on the Volume, which is the
 durable record once a finished run's entries expire.
 """

@@ -131,6 +131,7 @@ def test_observe_queued_running_and_silent(modal_backend):
     _record(tmp_path, "L1", "ta-1", heartbeat=_iso(-10))
     observation = backend.observe(plan, state)
     assert (observation.call, observation.task_id, observation.drained) == (Call.RUNNING, "ta-1", False)
+    assert observation.attempts == 1
     _record(tmp_path, "L1", "ta-1", heartbeat=_iso(-3600))
     assert backend.observe(plan, state).call is Call.UNKNOWN
 
@@ -182,3 +183,12 @@ class _Raises:
 )
 def test_call_outcomes_from_results_end_the_call_but_asking_errors_dont(error, expected):
     assert observe_call(_Raises(error))[0] is expected
+
+
+def test_an_unreadable_record_is_unknown_and_never_drained(modal_backend):
+    backend, plan, calls, tmp_path = modal_backend
+    calls["fc-1"] = RuntimeError("boom")  # the call has ended
+    _record(tmp_path, "L1", "ta-1", ended=_iso(-5))
+    (tmp_path / "r1" / "launches" / "L1" / "ta-2.json").write_text("")
+    observation = backend.observe(plan, _state_with_launch(plan))
+    assert (observation.call, observation.drained) == (Call.UNKNOWN, False)

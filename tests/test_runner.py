@@ -225,3 +225,22 @@ def test_heartbeat_survives_a_failed_write(tmp_path, monkeypatch, capsys):
     thread.join(timeout=2)
     assert "heartbeat failed" in capsys.readouterr().out
     assert all("heartbeat" in beat for beat in beats)
+
+
+def test_records_are_flushed_before_the_rename(tmp_path, monkeypatch):
+    synced = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or real_fsync(fd))
+    runner._write_atomically(str(tmp_path / "a" / "record.json"), "{}")
+    assert synced and (tmp_path / "a" / "record.json").read_text() == "{}"
+
+
+def test_an_unreadable_record_is_reported_not_skipped(tmp_path):
+    launch_dir = tmp_path / "r1" / "launches" / "L1"
+    launch_dir.mkdir(parents=True)
+    (launch_dir / "ta-1.json").write_text(json.dumps({"task_id": "ta-1", "node_rank": 0, "started": "x"}))
+    (launch_dir / "ta-2.json").write_text("")  # seen empty mid-update
+    with pytest.raises(runner.UnreadableRecord):
+        runner.launch_records(str(tmp_path / "r1"), "L1")
+    assert len(runner.launch_records(str(tmp_path / "r1"), "L1", skip_unreadable=True)) == 1
+    assert len(runner.all_records(str(tmp_path / "r1"))) == 1

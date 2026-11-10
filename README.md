@@ -90,7 +90,7 @@ uv run python -m zephon_modal replays path/to/job.py --run-id <you>-run
 takes it from there. `--steps` is the total to reach. Starting a finished or stopped
 run again resumes it. `launch` trains on one placement right now, without the
 reconciler: for references and experiments. A deployed app keeps its
-one-minute reconciler schedule until you `modal app stop` it.
+reconciler schedule until you `modal app stop` it.
 
 With Zephon's CLI installed (Zephon `main` after v0.2.1), the same commands
 are `zephon modal <command> ...`.
@@ -98,8 +98,8 @@ are `zephon modal <command> ...`.
 ## Reconciler
 
 Nothing long-lived watches a run. The deployed app has a `reconcile`
-function that Modal calls every minute (and right after `start`, `stop` or
-`recover`). Each call looks at every active run once, takes at most one
+function that Modal calls every `reconcile_minutes` (5 by default) and
+right after `start`, `stop` or `recover`. Each call looks at every active run once, takes at most one
 decision, and exits. Modal runs one call at a time (`max_containers=1`), so
 there is exactly one decision-maker with no locks, and no process that can
 outlive Modal's 24-hour limit or die holding the run.
@@ -136,8 +136,9 @@ Each tick, for each run:
 final commit. A container records itself before touching the run, and marks
 itself ended only in its last commit. A launch also checks, before touching
 the run, that it is still the run's current launch. If a launch doesn't
-confirm it stopped within 5 minutes, the run waits for an operator: check
-that its containers are gone, then `recover`.
+confirm it stopped within 10 minutes, the run waits for an operator: check
+that its containers are gone, then `recover`. A launch that has already
+ended and confirmed is replaced in the same tick.
 
 **Alerts** go to `ZEPHON_MODAL_ALERT_WEBHOOK` (a Slack-compatible incoming
 webhook, from `alert_secret`): give-ups, runs needing recovery, no new
