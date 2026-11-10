@@ -120,18 +120,11 @@ class ElasticJob:
         object.__setattr__(self, "app", modal.App(self.name))
         functions = {placement.name: self._register(placement) for placement in self.placements}
         object.__setattr__(self, "_functions", functions)
-        compare = self.app.function(
-            name="compare",
-            image=modal.Image.debian_slim(python_version="3.12").add_local_python_source("zephon_modal"),
-            volumes={RUNS_MOUNT: self.runs_volume},
-        )(runner.compare)
-        object.__setattr__(self, "_compare", compare)
-        replays = self.app.function(
-            name="replays",
-            image=modal.Image.debian_slim(python_version="3.12").add_local_python_source("zephon_modal"),
-            volumes={RUNS_MOUNT: self.runs_volume},
-        )(runner.replays)
-        object.__setattr__(self, "_replays", replays)
+        # The checks only read hash files: a small CPU image.
+        checks_image = modal.Image.debian_slim(python_version="3.12").add_local_python_source("zephon_modal")
+        for name, target in (("compare", runner.compare), ("replays", runner.replays)):
+            check = self.app.function(name=name, image=checks_image, volumes={RUNS_MOUNT: self.runs_volume})(target)
+            object.__setattr__(self, f"_{name}", check)
         config = {"app": self.name, "registry": self.registry_name, "runs_volume": _volume_name(self.runs_volume)}
         reconcile_function = self.app.function(
             name="reconcile",

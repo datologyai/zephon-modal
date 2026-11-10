@@ -102,7 +102,7 @@ def test_launches_on_the_preferred_placement_and_completes():
     run.tick()
     assert run.placement == CLUSTER
     assert run.backend.spawned[0].steps == 100 and run.backend.spawned[0].launch_id
-    run.tick(call=Call.RUNNING, task_id="ta-1", checkpoint=50)
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=50)
     assert run.state.checkpoint == 50
     # Already ended and confirmed: finished in the same tick.
     run.tick(call=Call.SUCCEEDED, checkpoint=100)
@@ -158,7 +158,7 @@ def test_cooled_down_placement_is_preferred_again_after_cooldown():
 def test_waits_for_every_container_to_confirm_before_a_successor():
     run = Harness()
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1")
+    run.tick(call=Call.RUNNING, attempts=1)
     run.tick(call=Call.FAILED, error="CalledProcessError", drained=False)
     assert run.state.status == "draining"
     run.tick(call=Call.FAILED, drained=False)
@@ -170,9 +170,9 @@ def test_waits_for_every_container_to_confirm_before_a_successor():
 def test_unconfirmed_launch_needs_an_operator():
     run = Harness(drain_timeout=300)
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1")
+    run.tick(call=Call.RUNNING, attempts=1)
     run.request(stop=True)
-    run.tick(call=Call.RUNNING, task_id="ta-1")
+    run.tick(call=Call.RUNNING, attempts=1)
     run.tick(seconds=300, call=Call.CANCELLED, drained=False)
     assert run.state.status == "needs recovery"
     assert "zephon modal recover" in run.backend.alerts[-1]
@@ -199,12 +199,12 @@ def test_recovery_relaunches():
 def test_too_many_restarts_moves_on():
     run = Harness(max_restarts=1)
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1")
+    run.tick(call=Call.RUNNING, attempts=1)
     run.tick(call=Call.QUEUED)
-    run.tick(call=Call.RUNNING, task_id="ta-2")
+    run.tick(call=Call.RUNNING, attempts=2)
     assert run.state.status == "running"
     run.tick(call=Call.QUEUED)
-    run.tick(call=Call.RUNNING, task_id="ta-3")
+    run.tick(call=Call.RUNNING, attempts=3)
     assert run.state.status == "draining"
     assert run.backend.cancelled == ["fc-1"]
     run.tick(call=Call.CANCELLED)
@@ -215,7 +215,7 @@ def test_too_many_restarts_moves_on():
 def test_function_timeout_relaunches_on_the_same_placement():
     run = Harness()
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1", checkpoint=10)
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=10)
     run.tick(call=Call.TIMED_OUT, checkpoint=10)
     assert len(run.backend.spawned) == 2 and run.placement == CLUSTER
     assert run.backend.cancelled == [] and run.state.failures == 0
@@ -235,17 +235,17 @@ def test_a_new_checkpoint_resets_the_failure_count():
     run = Harness(max_failures=2)
     run.tick()
     run.tick(call=Call.FAILED, error="boom")
-    run.tick(call=Call.RUNNING, task_id="ta-1", checkpoint=10)
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=10)
     assert run.state.failures == 0
 
 
 def test_stalled_launch_is_cancelled_and_counts_as_a_failure():
     run = Harness(stall_timeout=1800)
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1", checkpoint=10)
-    run.tick(seconds=1700, call=Call.RUNNING, task_id="ta-1", checkpoint=10)
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=10)
+    run.tick(seconds=1700, call=Call.RUNNING, attempts=1, checkpoint=10)
     assert run.state.status == "running"
-    run.tick(seconds=200, call=Call.RUNNING, task_id="ta-1", checkpoint=10)
+    run.tick(seconds=200, call=Call.RUNNING, attempts=1, checkpoint=10)
     assert run.state.status == "draining" and run.state.failures == 1
     assert run.backend.cancelled == ["fc-1"]
 
@@ -253,16 +253,16 @@ def test_stalled_launch_is_cancelled_and_counts_as_a_failure():
 def test_a_restart_gets_a_fresh_stall_budget():
     run = Harness(stall_timeout=1800)
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1")
+    run.tick(call=Call.RUNNING, attempts=1)
     run.tick(seconds=1700, call=Call.QUEUED)
-    run.tick(seconds=200, call=Call.RUNNING, task_id="ta-2")
+    run.tick(seconds=200, call=Call.RUNNING, attempts=2)
     assert run.state.status == "running"
 
 
 def test_unresponsive_launch_is_cancelled_after_the_heartbeat_timeout():
     run = Harness(heartbeat_timeout=300)
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1")
+    run.tick(call=Call.RUNNING, attempts=1)
     run.tick(call=Call.UNKNOWN, error="no heartbeat")
     run.tick(seconds=200, call=Call.UNKNOWN, error="no heartbeat")
     assert run.state.status == "running"
@@ -273,9 +273,9 @@ def test_unresponsive_launch_is_cancelled_after_the_heartbeat_timeout():
 def test_stop_cancels_and_waits():
     run = Harness()
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1")
+    run.tick(call=Call.RUNNING, attempts=1)
     run.request(stop=True)
-    run.tick(call=Call.RUNNING, task_id="ta-1")
+    run.tick(call=Call.RUNNING, attempts=1)
     assert run.state.status == "draining" and run.backend.cancelled == ["fc-1"]
     run.tick(call=Call.CANCELLED)
     assert run.state.status == "stopped"
@@ -297,7 +297,7 @@ def test_stop_while_draining_to_relaunch_stops_instead():
 def test_gpu_budget_gives_up():
     run = Harness(max_gpu_hours=10)
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1", gpu_hours=10.5)
+    run.tick(call=Call.RUNNING, attempts=1, gpu_hours=10.5)
     run.tick(call=Call.CANCELLED, gpu_hours=10.5)
     assert run.state.status == "gave up"
 
@@ -305,8 +305,8 @@ def test_gpu_budget_gives_up():
 def test_prunes_when_a_checkpoint_lands():
     run = Harness(keep_checkpoints=3)
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1", checkpoint=10)
-    run.tick(call=Call.RUNNING, task_id="ta-1", checkpoint=10)
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=10)
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=10)
     assert run.backend.pruned == [3]
 
 
@@ -372,10 +372,10 @@ def test_a_failure_moves_the_retry_to_the_next_placement():
 def test_a_timeout_without_progress_since_the_last_one_is_a_failure():
     run = Harness()
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1", checkpoint=10)
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=10)
     run.tick(call=Call.TIMED_OUT, checkpoint=10)
     assert run.state.failures == 0 and len(run.backend.spawned) == 2
-    run.tick(call=Call.RUNNING, task_id="ta-2", checkpoint=10)
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=10)
     run.tick(call=Call.TIMED_OUT, checkpoint=10)
     assert run.state.failures == 1
     assert "timed out without progress" in run.events
@@ -385,7 +385,7 @@ def test_timeouts_with_progress_in_between_are_boundaries():
     run = Harness()
     run.tick()
     for checkpoint in (10, 20, 30):
-        run.tick(call=Call.RUNNING, task_id=f"ta-{checkpoint}", checkpoint=checkpoint)
+        run.tick(call=Call.RUNNING, attempts=1, checkpoint=checkpoint)
         run.tick(call=Call.TIMED_OUT, checkpoint=checkpoint)
     assert run.state.failures == 0 and run.state.status == "running"
     assert len(run.backend.spawned) == 4
@@ -412,8 +412,8 @@ def test_an_ended_launch_still_waits_for_its_containers():
 def test_a_restart_between_ticks_still_counts():
     run = Harness(max_restarts=1)
     run.tick()
-    run.tick(call=Call.RUNNING, task_id="ta-1", attempts=1)
+    run.tick(call=Call.RUNNING, attempts=1)
     # Attempts 2 came and went between ticks; the next tick sees attempt 3 running.
-    run.tick(call=Call.RUNNING, task_id="ta-3", attempts=3)
+    run.tick(call=Call.RUNNING, attempts=3)
     assert "restarted" in run.events
     assert run.state.status == "draining" and run.backend.cancelled == ["fc-1"]

@@ -129,9 +129,10 @@ def discard_incomplete(layout: CheckpointLayout, run_dir: str, tag: str) -> Chec
 def prune(layout: CheckpointLayout, run_dir: str, keep: int) -> list[int]:
     """Delete checkpoints older than the ``keep`` latest complete ones; returns the steps deleted.
 
-    Trainers can't do this themselves on a multi-node launch (see
-    :attr:`~zephon_modal.context.LaunchContext.keep_all_checkpoints`), so the
-    reconciler does it from its own, committed view of the Volume. The latest
+    Trainers should keep every checkpoint: on a multi-node launch each node
+    sees only its own uncommitted Volume files, so a trainer pruning there
+    leaves other nodes' shards behind as partial checkpoints. The reconciler
+    prunes instead, from its own committed view of the Volume. The latest
     complete checkpoint, which any resume loads, is always kept, and so is
     anything newer than it (a save that may still be in progress).
     """
@@ -143,7 +144,6 @@ def prune(layout: CheckpointLayout, run_dir: str, keep: int) -> list[int]:
     deleted = []
     for step, path in sorted(layout.steps(run_dir).items()):
         if step < kept[-1]:
-            # A trainer pruning its own checkpoints may have got there first.
             shutil.rmtree(path, ignore_errors=True)
             deleted.append(step)
     # Set-aside partial saves older than anything kept are no use either.

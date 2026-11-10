@@ -1,7 +1,6 @@
 """The reconciler's Modal side, against a fake registry, a temporary Volume and fake calls."""
 
 import dataclasses
-import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 
@@ -117,7 +116,7 @@ def _record(backend, launch_id, task_id, **fields):
 
 def _state_with_launch(plan, launch_id="L1", call_id="fc-1") -> RunState:
     state = new_state(plan, 0)
-    state.current = {"placement": "h100x8", "launch_id": launch_id, "call_id": call_id, "tasks": []}
+    state.current = {"placement": "h100x8", "launch_id": launch_id, "call_id": call_id}
     return state
 
 
@@ -128,7 +127,7 @@ def test_observe_queued_running_and_silent(modal_backend):
     assert backend.observe(plan, state).call is Call.QUEUED
     _record(backend, "L1", "ta-1", heartbeat=_iso(-10))
     observation = backend.observe(plan, state)
-    assert (observation.call, observation.task_id, observation.drained) == (Call.RUNNING, "ta-1", False)
+    assert (observation.call, observation.drained) == (Call.RUNNING, False)
     assert observation.attempts == 1
     _record(backend, "L1", "ta-1", heartbeat=_iso(-3600))
     assert backend.observe(plan, state).call is Call.UNKNOWN
@@ -181,13 +180,3 @@ class _Raises:
 )
 def test_call_outcomes_from_results_end_the_call_but_asking_errors_dont(error, expected):
     assert observe_call(_Raises(error))[0] is expected
-
-
-def test_records_on_the_volume_are_not_what_the_reconciler_reads(modal_backend):
-    backend, plan, calls, tmp_path = modal_backend
-    calls["fc-1"] = None
-    # A history copy on the Volume, but nothing published to the registry yet.
-    launch_dir = tmp_path / "r1" / "launches" / "L1"
-    launch_dir.mkdir(parents=True)
-    (launch_dir / "ta-1.json").write_text(json.dumps({"task_id": "ta-1", "node_rank": 0, "started": _iso(-5)}))
-    assert backend.observe(plan, _state_with_launch(plan)).call is Call.QUEUED

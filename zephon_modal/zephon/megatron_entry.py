@@ -17,11 +17,9 @@ so ``zephon_modal compare`` works on Megatron runs unchanged.
 
 from __future__ import annotations
 
-import logging
 import os
 import runpy
 import sys
-import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -31,8 +29,6 @@ from zephon_modal.context import context
 from zephon_modal.verify.hashes import StepHashRecorder, hash_file_name, pack_fields
 from zephon_modal.zephon import validate_step_size
 
-logger = logging.getLogger(__name__)
-
 
 class SampleHashingIterator:
     """Iterator over a MegatronZephonDataLoader that records per-step sequence hashes.
@@ -41,26 +37,15 @@ class SampleHashingIterator:
     loader, so Megatron's dataloader checkpointing sees the Zephon loader.
     """
 
-    def __init__(self, loader: Any, hashes: StepHashRecorder, dp_rank: int) -> None:
+    def __init__(self, loader: Any, hashes: StepHashRecorder) -> None:
         self._loader = loader
         self._hashes = hashes
-        self._dp_rank = dp_rank
-        self._iter_start: float | None = None
 
     def __iter__(self) -> SampleHashingIterator:
         return self
 
     def __next__(self) -> dict:
-        if self._iter_start is None:
-            self._iter_start = time.perf_counter()
-            batch = next(self._loader)
-            logger.warning(
-                "[zephon_modal] dp_rank %d: first Zephon microbatch after %.1fs",
-                self._dp_rank,
-                time.perf_counter() - self._iter_start,
-            )
-        else:
-            batch = next(self._loader)
+        batch = next(self._loader)
         names = ("tokens", "labels", "loss_mask", "position_ids")
         if any(name not in batch for name in names):
             raise ValueError("Training batch lacks fields required for complete sample hashing")
@@ -101,7 +86,7 @@ def _install_sample_hashing() -> None:
             consumed_microbatches=get_args().iteration * microbatches_per_step,
             schema="megatron-batch-v2",
         )
-        return SampleHashingIterator(loader, hashes, dp_rank), valid, test
+        return SampleHashingIterator(loader, hashes), valid, test
 
     provider.is_distributed = zephon_provider.is_distributed  # type: ignore[attr-defined]
     # The script imports the provider by name when it runs, so it picks this up.

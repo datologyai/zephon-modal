@@ -66,8 +66,11 @@ job = ElasticJob(
 
 In the torchtitan recipe, use `SampleHashingZephonDataLoader.Config` from
 `zephon_modal.zephon.torchtitan`; take `canonical_replicas` and
-`aggregate_store` from `zephon_modal.zephon.settings()`, and `run_id`, the
-step target and `keep_all_checkpoints` from `zephon_modal.context()`. For
+`aggregate_store` from `zephon_modal.zephon.settings()`, and `run_id` and the
+step target from `zephon_modal.context()`. Have the trainer keep every
+checkpoint (torchtitan's `keep_latest_k=0`) and pass `--keep-checkpoints` to
+`start` instead: on a cluster each node sees only its own uncommitted files,
+so a trainer pruning there leaves partial checkpoints behind. For
 Megatron-LM-zephon, pass `Megatron(args="my_recipes:pretrain_args",
 script="pretrain_gpt_zephon.py", entry="zephon_modal.zephon.megatron_entry")`.
 Both wrappers reject a step that isn't a whole number of lane windows.
@@ -127,8 +130,8 @@ Each tick, for each run:
   placement if there is one, so a bad node or shape doesn't take every retry.
   After `--max-failures` (3) in a row without a new checkpoint, give up.
 - **New checkpoint:** reset the failure count, and with `--keep-checkpoints N`
-  delete all but the latest N complete checkpoints (trainers can't prune on
-  multi-node launches, where each node sees only its own files).
+  delete all but the latest N complete checkpoints, from the reconciler's
+  committed view of the Volume.
 - **`--max-gpu-hours`:** give up once the run's attempts add up to that.
 
 **One writer at a time.** Before any successor launch, the old one must
@@ -138,8 +141,8 @@ before touching the run, refreshes it every 30 s, and marks it ended only
 after its last Volume commit has returned. These records live in the Dict,
 not on the Volume: a Dict write is atomic and immediately visible, while a
 reader can catch a Volume commit half-applied (we saw records read back
-empty). A copy goes to `launches/` on the Volume as history. A launch also checks, before touching
-the run, that it is still the run's current launch. If a launch doesn't
+empty). A launch also checks, before touching the run, that it is still the
+run's current launch. If a launch doesn't
 confirm it stopped within 10 minutes, the run waits for an operator: check
 that its containers are gone, then `recover`. A launch that has already
 ended and confirmed is replaced in the same tick.
@@ -163,7 +166,8 @@ resume:
   `shutdown_timeout` (10 s), kills the trainer if needed, and commits.
 - **Hashes survive.** Each node syncs changed hash files to the run every
   30 s, so background commits keep them even if the final commit doesn't
-  finish. Every attempt hashes into its own namespace (`<launch_id>.aNNNN`),
+  finish. Every attempt hashes into its own time-ordered namespace
+  (`<launch_id>.a<time>-<hex>`),
   and files are split every 1000 steps so syncs stay small.
 - **Every node resumes from the same checkpoint.** Node 0 sets aside
   incomplete checkpoints (a DCP checkpoint counts only if every shard its
@@ -175,8 +179,8 @@ resume:
   Anything else (trainer flags, this library) may change between launches.
 
 A stopped run loses the steps since its last checkpoint. Saving on the way
-out only helps for small checkpoints: the save and its commit must fit in
-the grace period, and Qwen3-0.6B with optimizer state (~8 GB) took 37 s on 4 H100s.
+out doesn't fit: the save and its commit must finish within the grace
+period, and Qwen3-0.6B with optimizer state (~8 GB) took 37 s on 4 H100s.
 
 ## Verification
 
@@ -235,12 +239,12 @@ Exercised live with the reconciler, on T4s: a stopped container restarted by
 Modal and followed to completion; a launch ending at the function timeout,
 draining and relaunching; `stop`, then `start` again resuming; checkpoint
 pruning; and failed launches retried, then given up on, each after draining.
-Every one matched a reference run under the strict comparison. Earlier
-versions exercised moving between placements, GPU fallbacks and cluster
-resume on H100s.
+On H100s (in zephon-modal-demo): torchtitan moving from a 2-node cluster
+(DP 16) to one node (DP 8) after a stop, and Megatron restarting in place on
+a 2-node cluster. Every one matched a reference run under the strict
+comparison, and `replays` matched across the resize.
 
-Not yet exercised: the reconciler on H100s or clusters, a queue timeout
-under the reconciler (Modal allocated every time), moving to another
-placement after a failure, the alert webhook, `recover`, a real preemption
-(all were `modal container stop`), and anything longer than a day. Rehearse
-a long run on T4s, then on the real shape, first.
+Not yet exercised: a queue timeout under the reconciler (Modal allocated
+every time), moving to another placement after a failure, the alert webhook,
+`recover`, a real preemption (all were `modal container stop`), and anything
+longer than a day. Rehearse a long run on T4s, then on the real shape, first.

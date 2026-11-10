@@ -28,7 +28,6 @@ def _read(sample_hash_dir: str) -> dict[int, dict[str, dict[str, Any]]]:
     """``{step: {attempt: {"dp", "records": {file: record}}}}`` for one run.
 
     An attempt is a hash file's launch-ID prefix (launch ID plus attempt tag).
-    Within one file, the last record for a step wins (legacy files repeated steps).
     """
     per_step: dict[int, dict[str, dict[str, Any]]] = {}
     if not os.path.isdir(sample_hash_dir):
@@ -58,13 +57,16 @@ def _digest(attempt: str, entry: dict[str, Any]) -> dict[str, Any]:
     )
     records = [copies[0] for _, copies in sorted(by_dp_rank.items())]
     all_records = [copy for copies in by_dp_rank.values() for copy in copies]
+    # Records from before schemas existed hashed tokens only, so they're never comparable.
+    schemas = {record.get("schema") for record in all_records}
     rows = [row for record in records for row in record["row_hashes"]]
     complete = (
         entry["dp"] > 0
         and peers_agree
         and set(by_dp_rank) == set(range(entry["dp"]))
         and all(record["dp"] == entry["dp"] and record["row_hashes"] for record in all_records)
-        and len({record.get("schema", "tokens-v1") for record in all_records}) == 1
+        and len(schemas) == 1
+        and None not in schemas
     )
     return {
         "digest": hashlib.sha256("".join(sorted(rows)).encode()).hexdigest(),
@@ -72,7 +74,7 @@ def _digest(attempt: str, entry: dict[str, Any]) -> dict[str, Any]:
         "dp": entry["dp"],
         "complete": complete,
         "attempt": attempt,
-        "schema": records[0].get("schema", "tokens-v1"),
+        "schema": records[0].get("schema"),
     }
 
 
