@@ -118,13 +118,13 @@ from zephon_modal import ElasticJob, Placement, Torchtitan
 from zephon_modal.zephon import Zephon
 
 job = ElasticJob(
-    name="qwen3",                       # the Modal app name
-    image=training_image,               # framework + zephon>=0.2.1 + your recipe modules
+    name="qwen3",  # the Modal app name
+    image=training_image,  # framework + zephon>=0.2.1 + your recipe modules
     adapter=Torchtitan(module="my_recipes", config="qwen3_0p6b_zephon"),
-    data=Zephon(canonical_replicas=16), # optional: same samples at any DP degree dividing 16
+    data=Zephon(canonical_replicas=16),  # optional: same samples at any DP degree dividing 16
     placements=[
-        Placement("H100:8", nodes=2),                   # preferred: 2 nodes, DP 16
-        Placement("H100:8", fallbacks=("H100:4",)),     # then one node, DP 8 or 4
+        Placement("H100:8", nodes=2),  # preferred: 2 nodes, DP 16
+        Placement("H100:8", fallbacks=("H100:4",)),  # then one node, DP 8 or 4
     ],
     runs_volume=modal.Volume.from_name("my-runs", create_if_missing=True, version=2),
     volumes={"/data": modal.Volume.from_name("my-data")},
