@@ -37,20 +37,9 @@ export ZEPHON_MODAL_TORCHTITAN_COMPILE_CACHE_VOLUME=<you>-tt-compile-cache
 Multi-node clusters must be enabled on your Modal workspace for the
 `2xh100x8` placement.
 
-The same recipe and image definition support the default pre-sync commit
-and the upstream sync in [torchtitan-zephon #12](https://github.com/datologyai/torchtitan-zephon/pull/12).
-To try the sync, export its full commit SHA before running any command:
-
-```bash
-export ZEPHON_MODAL_TORCHTITAN_COMMIT=c6a084110448d830b6cc0773afe36fca34c4b20f
-```
-
-Changing the commit builds a separate cached image. Each checkout's own
-requirements select its `torch_checkpointing` dependency: the pre-sync
-checkout pins a Git commit, and the sync pins version 0.1.1. The image adds
-no checkpointing override. The recipe sets Flex attention explicitly to
-preserve its uncapped packed data stream across both versions, and sets
-`training.max_context_length` only on versions that still expose it.
+Set `ZEPHON_MODAL_TORCHTITAN_COMMIT` to a full commit SHA to select the
+TorchTitan revision used by the training image. Changing it rebuilds the
+image from that revision and its requirements.
 
 ## Stage the data, once
 
