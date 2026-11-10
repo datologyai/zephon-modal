@@ -18,11 +18,15 @@ For each run, :func:`tick` compares the plan with what it observes:
 - Queued longer than ``queue_timeout``, or restarted by Modal (preempted)
   more than ``max_restarts`` times: cancel, cool the placement down, move on.
 - Running with no new checkpoint for ``stall_timeout``: cancel; it counts
-  as a failure.
+  as a failure. So does a node that stops heartbeating or exits early.
 - Hit the function timeout: launch again; the run resumes from its checkpoint.
 - Failed: cool the placement down and launch again (on the next placement
   if there is one), until ``max_failures`` failures in a row without a new
   checkpoint, then give up.
+- Lost by Modal (an internal failure): the same, but against its own, larger
+  budget, ``max_lost``: it says nothing about the trainer.
+- Modal can't be asked: wait. Not knowing is no reason to cancel, and the
+  containers' heartbeats still show whether they're alive.
 - Finished: done.
 
 Before any successor, the old launch must *drain*: its call has ended and
@@ -66,10 +70,14 @@ class Policy:
             checkpoint before it's treated as hung and cancelled.
         max_failures: Failed launches in a row, without a new checkpoint in
             between, before giving up.
+        max_lost: Launches in a row that Modal lost to an internal failure,
+            without a new checkpoint in between, before giving up. These
+            don't count toward ``max_failures``.
         drain_timeout: Seconds to wait for a finished or cancelled launch's
             containers to record their final commit.
-        heartbeat_timeout: Seconds without a heartbeat from a running launch
-            before it's treated as gone.
+        heartbeat_timeout: Seconds a node of a running launch may go without
+            a heartbeat (or stay exited while the others run) before the
+            launch is treated as gone.
         keep_checkpoints: Complete checkpoints to keep; older ones are deleted.
             ``None`` keeps everything (as trainers must on multi-node launches).
         max_gpu_hours: Give up once the run's attempts add up to this many GPU hours.
@@ -82,6 +90,7 @@ class Policy:
     cooldown: float = 30 * 60
     stall_timeout: float = 60 * 60
     max_failures: int = 3
+    max_lost: int = 10
     drain_timeout: float = 10 * 60
     heartbeat_timeout: float = 5 * 60
     keep_checkpoints: int | None = None
@@ -99,8 +108,8 @@ class Policy:
         )
         if min(durations) <= 0:
             raise ValueError("Policy durations must be positive")
-        if self.max_restarts < 0 or self.max_failures < 1:
-            raise ValueError("max_restarts must be nonnegative and max_failures positive")
+        if self.max_restarts < 0 or self.max_failures < 1 or self.max_lost < 1:
+            raise ValueError("max_restarts must be nonnegative, and max_failures and max_lost positive")
         if self.keep_checkpoints is not None and self.keep_checkpoints < 1:
             raise ValueError("keep_checkpoints must be positive")
 
@@ -120,14 +129,16 @@ class Call(enum.Enum):
 
     QUEUED = "queued"  # no container running: not started yet, or a restart pending
     RUNNING = "running"
+    SILENT = "silent"  # running, but a node stopped heartbeating or exited early
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    LOST = "lost"  # Modal's own internal failure, not the trainer's
     TIMED_OUT = "timed out"
     CANCELLED = "cancelled"
-    UNKNOWN = "unknown"  # couldn't tell: an API error, or a silent container
+    UNKNOWN = "unknown"  # couldn't ask Modal, and the containers' records don't say
 
 
-ENDED = (Call.SUCCEEDED, Call.FAILED, Call.TIMED_OUT, Call.CANCELLED)
+ENDED = (Call.SUCCEEDED, Call.FAILED, Call.LOST, Call.TIMED_OUT, Call.CANCELLED)
 
 
 @dataclass(frozen=True)
@@ -168,6 +179,7 @@ class RunState:
     draining: dict[str, Any] | None = None
     cooling_until: dict[str, float] = field(default_factory=dict)
     failures: int = 0
+    lost: int = 0
     checkpoint: int | None = None
     progress_at: float = 0.0
     quiet_alerted_at: float = 0.0
@@ -310,7 +322,7 @@ def tick(
     if observation.checkpoint is not None and (state.checkpoint is None or observation.checkpoint > state.checkpoint):
         state.checkpoint = observation.checkpoint
         state.progress_at = now
-        state.failures = 0
+        state.failures = state.lost = 0
         _event(state, now, "checkpoint", step=observation.checkpoint)
         if policy.keep_checkpoints is not None:
             deleted = backend.prune(plan, policy.keep_checkpoints)
@@ -325,7 +337,7 @@ def tick(
 
     if state.status == "draining":
         assert state.draining is not None
-        if observation.call in (Call.QUEUED, Call.RUNNING, Call.UNKNOWN) or not observation.drained:
+        if observation.call in (Call.QUEUED, Call.RUNNING, Call.SILENT, Call.UNKNOWN) or not observation.drained:
             if now - state.draining["since"] >= policy.drain_timeout:
                 state.status = "needs recovery"
                 _event(state, now, "needs recovery", call=observation.call and observation.call.value)
@@ -369,16 +381,21 @@ def tick(
     def cool_down() -> None:
         state.cooling_until[placement] = now + policy.cooldown
 
-    def failed(reason: str, error: str | None) -> None:
-        state.failures += 1
+    def failed(reason: str, error: str | None, *, lost: bool = False) -> None:
+        count = (state.lost if lost else state.failures) + 1
+        limit = policy.max_lost if lost else policy.max_failures
+        then = "give up" if count >= limit else "launch"
+        # Cancels first: if that raises, nothing has changed and the next tick tries again.
+        _drain(state, backend, now, reason, then, cancel=True, error=error, **{"lost" if lost else "failures": count})
+        if lost:
+            state.lost = count
+        else:
+            state.failures = count
         # The next launch tries another placement: a bad node or shape shouldn't take every retry.
         cool_down()
-        then = "give up" if state.failures >= policy.max_failures else "launch"
-        _drain(state, backend, now, reason, then, cancel=True, error=error, failures=state.failures)
         if then == "give up":
-            backend.alert(
-                state.run_id, f"{state.run_id}: {reason} ({error}); giving up after {state.failures} failures"
-            )
+            kind = "launches lost by Modal" if lost else "failures"
+            backend.alert(state.run_id, f"{state.run_id}: {reason} ({error}); giving up after {count} {kind}")
 
     if call is Call.SUCCEEDED:
         _drain(state, backend, now, "launch finished", "complete", cancel=False)
@@ -391,12 +408,21 @@ def tick(
             _drain(state, backend, now, "function timeout", "launch", cancel=False)
     elif call in (Call.FAILED, Call.CANCELLED):
         failed(f"launch {call.value}", observation.error)
+    elif call is Call.LOST:
+        failed("launch lost by Modal", observation.error, lost=True)
     elif call is Call.UNKNOWN:
-        unknown_since = current.setdefault("unknown_since", now)
-        if now - unknown_since >= policy.heartbeat_timeout:
+        # Not knowing isn't evidence of trouble; if it lasts, the quiet alert says so.
+        if "unknown_since" not in current:
+            current["unknown_since"] = now
+            _event(state, now, "can't observe the launch", error=observation.error)
+    elif call is Call.SILENT:
+        current.pop("unknown_since", None)
+        silent_since = current.setdefault("silent_since", now)
+        if now - silent_since >= policy.heartbeat_timeout:
             failed("launch unresponsive", observation.error)
     elif call is Call.QUEUED:
         current.pop("unknown_since", None)
+        current.pop("silent_since", None)
         current["running_since"] = None
         current["queued_since"] = current.get("queued_since") or now
         if now - current["queued_since"] >= policy.queue_timeout:
@@ -404,6 +430,7 @@ def tick(
             _drain(state, backend, now, "queue timeout", "launch", cancel=True)
     elif call is Call.RUNNING:
         current.pop("unknown_since", None)
+        current.pop("silent_since", None)
         current["queued_since"] = None
         # Ticks are minutes apart, so attempts come from the containers' records:
         # a restart can start and end between ticks.
@@ -455,15 +482,39 @@ def gpu_hours(records: Sequence[Mapping[str, Any]], now: float, current_launch: 
     return total
 
 
+def silent_nodes(records: Sequence[Mapping[str, Any]], latest: Mapping[str, Any], now: float, timeout: float) -> str:
+    """Which nodes of the running attempt have gone quiet or exited; empty if none.
+
+    The attempt is node 0's latest record's; the other nodes' records join it
+    once their trainers start (they carry its ``attempt_tag``). A node whose
+    heartbeat is older than ``timeout``, or that has ended while node 0 runs,
+    counts: torchrun on the others may wait on it for a long time.
+    """
+    tag = latest.get("attempt_tag")
+    nodes = [record for record in records if tag and record.get("attempt_tag") == tag] or [latest]
+    gone = []
+    for record in sorted(nodes, key=lambda record: record.get("node_rank", 0)):
+        rank = record.get("node_rank", 0)
+        if "ended" in record:
+            gone.append(f"node {rank} exited ({record.get('outcome')})")
+            continue
+        beat = datetime.fromisoformat(record.get("heartbeat") or record["started"]).timestamp()
+        if now - beat > timeout:
+            gone.append(f"node {rank}: no heartbeat for {now - beat:.0f}s")
+    return "; ".join(gone)
+
+
 def observe_call(call: Any) -> tuple[Call | None, str | None]:
     """A Modal call's state if it has ended (or can't be read), else ``None``.
 
     Every exception Modal builds from a call's *result* means the call has
     ended: its timeout, an internal failure, a remote error, or the remote
     code's own exception (``CalledProcessError`` from the trainer, or the
-    cancellation itself). Errors from *asking* (connection, service,
-    client-side timeouts) say nothing about the call, so they're unknown,
-    which never starts a successor.
+    cancellation itself). Only ``InternalFailure`` is Modal's own failure
+    (``LOST``); a ``RemoteError`` can be a container the trainer crashed or
+    ran out of memory, so it counts as the launch's. Errors from *asking*
+    (connection, service, client-side timeouts) say nothing about the call,
+    so they're unknown, which never starts a successor.
     """
     import modal
     from modal import exception
@@ -476,7 +527,9 @@ def observe_call(call: Any) -> tuple[Call | None, str | None]:
         return Call.TIMED_OUT, str(error)
     except exception.InputCancellation as error:
         return Call.CANCELLED, str(error) or "cancelled"
-    except (exception.InternalFailure, exception.RemoteError, exception.ExecutionError) as error:
+    except exception.InternalFailure as error:
+        return Call.LOST, f"{type(error).__name__}: {error}"
+    except (exception.RemoteError, exception.ExecutionError) as error:
         return Call.FAILED, f"{type(error).__name__}: {error}"
     except (modal.exception.Error, OSError) as error:
         return Call.UNKNOWN, f"{type(error).__name__}: {error}"
@@ -515,21 +568,24 @@ class ModalBackend(Backend):
         records = [record for record in run_records if record["launch_id"] == current["launch_id"]]
         drained = all("ended" in record for record in records)
         call, error = observe_call(modal.FunctionCall.from_id(current["call_id"]))
-        if call is not None:
+        if call is not None and call is not Call.UNKNOWN:
             return Observation(call=call, error=error, drained=drained, checkpoint=checkpoint, gpu_hours=hours)
+        # Still going, or Modal couldn't say: the containers' own records tell the rest.
         attempts = [record for record in records if record.get("node_rank") == 0]
         if not attempts or "ended" in attempts[-1]:
+            # Without the call's state, no running container could also mean it has ended.
+            call = call or Call.QUEUED
             return Observation(
-                call=Call.QUEUED, drained=drained, checkpoint=checkpoint, gpu_hours=hours, attempts=len(attempts)
+                call=call, error=error, drained=drained, checkpoint=checkpoint, gpu_hours=hours, attempts=len(attempts)
             )
-        latest = attempts[-1]
-        beat = datetime.fromisoformat(latest.get("heartbeat") or latest["started"]).timestamp()
-        if time.time() - beat > plan.policy.heartbeat_timeout:
-            return Observation(
-                call=Call.UNKNOWN, error="no heartbeat", drained=drained, checkpoint=checkpoint, gpu_hours=hours
-            )
+        gone = silent_nodes(records, attempts[-1], time.time(), plan.policy.heartbeat_timeout)
         return Observation(
-            call=Call.RUNNING, drained=drained, checkpoint=checkpoint, gpu_hours=hours, attempts=len(attempts)
+            call=Call.SILENT if gone else Call.RUNNING,
+            error=gone or None,
+            drained=drained,
+            checkpoint=checkpoint,
+            gpu_hours=hours,
+            attempts=len(attempts),
         )
 
     def spawn(self, spec: RunSpec) -> str:

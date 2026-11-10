@@ -201,6 +201,30 @@ def test_heartbeat_survives_a_failed_write(tmp_path, monkeypatch, capsys):
     assert all("heartbeat" in beat for beat in beats)
 
 
+@pytest.mark.parametrize(
+    ("current", "stops"),
+    [("this", False), ("other", True), (None, True), ("unreadable", False)],
+)
+def test_heartbeat_stops_a_superseded_launch(tmp_path, monkeypatch, current, stops):
+    from types import SimpleNamespace
+
+    spec = dataclasses.replace(_spec(Placement("H100:4")), runs_mount=str(tmp_path), registry_name="job-runs")
+    ctx = launch_context(spec, NodeTopology(1, 0, None))
+
+    class Registry:
+        def state(self, run_id):
+            if current == "unreadable":
+                raise ConnectionError("Dict unavailable")
+            launch_id = {"this": spec.launch_id, "other": "L-new"}.get(current)
+            return SimpleNamespace(current={"launch_id": launch_id} if launch_id else None)
+
+    monkeypatch.setattr(runner, "_registry", lambda spec: Registry())
+    monkeypatch.setattr(runner, "publish_attempt", lambda *args, **kwargs: None)
+    superseded = []
+    runner._beat(spec, ctx, {"outcome": "running"}, lambda: superseded.append(True))
+    assert bool(superseded) == stops
+
+
 class _Store(dict):
     def put(self, key, value, skip_if_exists=False):
         self[key] = value
