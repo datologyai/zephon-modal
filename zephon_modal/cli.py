@@ -76,6 +76,7 @@ def _start(args: argparse.Namespace) -> int:
         cooldown=args.cooldown,
         stall_timeout=args.stall_timeout,
         max_failures=args.max_failures,
+        max_lost=args.max_lost,
         keep_checkpoints=args.keep_checkpoints,
         max_gpu_hours=args.max_gpu_hours,
     )
@@ -225,6 +226,12 @@ def register(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=defaults.max_failures,
         help="Failures in a row without progress before giving up",
+    )
+    start.add_argument(
+        "--max-lost",
+        type=int,
+        default=defaults.max_lost,
+        help="Launches in a row Modal loses to internal failures, without progress, before giving up",
     )
     start.add_argument("--keep-checkpoints", type=int, help="Delete all but this many latest complete checkpoints")
     start.add_argument("--max-gpu-hours", type=float, help="Give up after this many GPU hours in total")

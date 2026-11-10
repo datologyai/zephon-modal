@@ -130,7 +130,38 @@ def test_observe_queued_running_and_silent(modal_backend):
     assert (observation.call, observation.drained) == (Call.RUNNING, False)
     assert observation.attempts == 1
     _record(backend, "L1", "ta-1", heartbeat=_iso(-3600))
+    assert backend.observe(plan, state).call is Call.SILENT
+
+
+def test_an_api_error_falls_back_to_the_heartbeats(modal_backend):
+    backend, plan, calls, tmp_path = modal_backend
+    calls["fc-1"] = exception.ConnectionError("network")
+    state = _state_with_launch(plan)
+    # No container running: queued, or ended? Can't tell.
     assert backend.observe(plan, state).call is Call.UNKNOWN
+    _record(backend, "L1", "ta-1", heartbeat=_iso(-10))
+    observation = backend.observe(plan, state)
+    assert (observation.call, observation.attempts) == (Call.RUNNING, 1)
+    _record(backend, "L1", "ta-1", heartbeat=_iso(-3600))
+    assert backend.observe(plan, state).call is Call.SILENT
+
+
+def test_every_node_of_the_running_attempt_must_heartbeat(modal_backend):
+    backend, plan, calls, tmp_path = modal_backend
+    calls["fc-1"] = None
+    state = _state_with_launch(plan)
+    # The first attempt's node 1 died silently; it's not this attempt's.
+    _record(backend, "L1", "ta-1", started=_iso(-900), ended=_iso(-800), attempt_tag=".a1")
+    _record(backend, "L1", "ta-2", node_rank=1, started=_iso(-900), heartbeat=_iso(-850), attempt_tag=".a1")
+    _record(backend, "L1", "ta-3", heartbeat=_iso(-10), attempt_tag=".a2")
+    _record(backend, "L1", "ta-4", node_rank=1, heartbeat=_iso(-10), attempt_tag=".a2")
+    assert backend.observe(plan, state).call is Call.RUNNING
+    _record(backend, "L1", "ta-4", node_rank=1, heartbeat=_iso(-600), attempt_tag=".a2")
+    observation = backend.observe(plan, state)
+    assert observation.call is Call.SILENT and "node 1: no heartbeat" in observation.error
+    _record(backend, "L1", "ta-4", node_rank=1, ended=_iso(-5), outcome="failed", attempt_tag=".a2")
+    observation = backend.observe(plan, state)
+    assert observation.call is Call.SILENT and "node 1 exited (failed)" in observation.error
 
 
 def test_observe_a_restart_pending_after_a_preemption(modal_backend):
@@ -169,7 +200,7 @@ class _Raises:
         (exception.FunctionTimeoutError("24h"), Call.TIMED_OUT),
         (exception.InputCancellation(), Call.CANCELLED),
         (exception.RemoteError("cancelled"), Call.FAILED),
-        (exception.InternalFailure("worker lost"), Call.FAILED),
+        (exception.InternalFailure("worker lost"), Call.LOST),
         (exception.ExecutionError("container crashed"), Call.FAILED),
         (subprocess.CalledProcessError(1, ["torchrun"]), Call.FAILED),
         (exception.ConnectionError("network"), Call.UNKNOWN),

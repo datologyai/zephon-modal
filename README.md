@@ -123,13 +123,22 @@ Each tick, for each run:
 - **Preempted:** Modal restarts the launch on the same placement by itself.
   Past `--max-restarts` (2), cancel, cool down, move on.
 - **Running without a new checkpoint for `--stall-timeout`** (1 h): treat it
-  as hung and cancel; it counts as a failure. So does a launch whose
-  heartbeat goes quiet for 5 min.
+  as hung and cancel; it counts as a failure. So does a launch with a node,
+  any node of the running attempt, whose heartbeat has gone quiet or that
+  has exited while the others run, for 5 min: torchrun on the rest could
+  otherwise wait on it until the stall timeout.
 - **Hit the function `timeout`** (24 h by default): launch again; it resumes.
 - **Failed:** cool the placement down and launch again, on the next
   placement if there is one, so a bad node or shape doesn't take every retry.
   After `--max-failures` (3) in a row without a new checkpoint, give up.
-- **New checkpoint:** reset the failure count, and with `--keep-checkpoints N`
+- **Lost by Modal** (`InternalFailure`, Modal's own failure): the same, but
+  against `--max-lost` (10) instead: it says nothing about the trainer, so it
+  shouldn't use up the failure budget. A `RemoteError` still counts as a
+  failure: a container that crashed or ran out of memory looks like one.
+- **Modal can't be asked** (connection or service errors): use the
+  containers' heartbeats instead, which come from the registry, and never
+  cancel only for not knowing. If it lasts, the 2-hour quiet alert says so.
+- **New checkpoint:** reset the failure counts, and with `--keep-checkpoints N`
   delete all but the latest N complete checkpoints, from the reconciler's
   committed view of the Volume.
 - **`--max-gpu-hours`:** give up once the run's attempts add up to that.
@@ -142,7 +151,10 @@ after its last Volume commit has returned. These records live in the Dict,
 not on the Volume: a Dict write is atomic and immediately visible, while a
 reader can catch a Volume commit half-applied (we saw records read back
 empty). A launch also checks, before touching the run, that it is still the
-run's current launch. If a launch doesn't
+run's current launch, and checks again with every heartbeat: if the
+reconciler has moved on (after a `recover`, or a spawn that failed on our
+side but not Modal's), the launch stops its trainer and commits. A failed
+read of the registry isn't a reason to stop. If a launch doesn't
 confirm it stopped within 10 minutes, the run waits for an operator: check
 that its containers are gone, then `recover`. A launch that has already
 ended and confirmed is replaced in the same tick.

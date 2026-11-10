@@ -28,7 +28,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -262,14 +262,21 @@ def check_manifest(spec: RunSpec) -> None:
     _write_atomically(path, json.dumps(manifest, indent=2))
 
 
-def _check_current(spec: RunSpec) -> None:
-    """Refuse to run a launch the reconciler has moved on from."""
+def superseded(spec: RunSpec) -> bool:
+    """Whether the reconciler has moved on from this launch (never, without a reconciler).
+
+    Raises whatever reading the registry raises: a failed read isn't evidence.
+    """
     registry = _registry(spec)
     if registry is None:
-        return
-    state = registry.state(spec.run_id)
-    current = getattr(state, "current", None) or {}
-    if current.get("launch_id") != spec.launch_id:
+        return False
+    current = getattr(registry.state(spec.run_id), "current", None) or {}
+    return current.get("launch_id") != spec.launch_id
+
+
+def _check_current(spec: RunSpec) -> None:
+    """Refuse to run a launch the reconciler has moved on from."""
+    if superseded(spec):
         raise RuntimeError(f"Launch {spec.launch_id} is no longer {spec.run_id}'s current launch")
 
 
@@ -343,20 +350,36 @@ def sync_sample_hashes(spec: RunSpec) -> None:
             _synced[source] = (stat.st_size, stat.st_mtime)
 
 
-def _heartbeat(spec: RunSpec, ctx: LaunchContext, attempt: dict[str, Any], done: threading.Event) -> None:
-    """Sync hashes and refresh the attempt record until the trainer stops.
+def _heartbeat(
+    spec: RunSpec,
+    ctx: LaunchContext,
+    attempt: dict[str, Any],
+    done: threading.Event,
+    supersede: Callable[[], None] | None = None,
+) -> None:
+    """Sync hashes, refresh the attempt record and check the launch is still current, until the trainer stops.
+
+    The launch checks it's current before it starts, but the reconciler can
+    move on while it runs: after an operator's ``recover``, or a spawn that
+    failed on our side but not Modal's. Then ``supersede`` stops the trainer,
+    so two launches overlap for at most a beat and the trainer's shutdown.
 
     Errors are logged, never fatal: a dead heartbeat would get a healthy
-    launch cancelled as unresponsive.
+    launch cancelled as unresponsive, and a failed read isn't a reason to stop.
     """
     while not done.wait(SYNC_SECONDS):
-        _beat(spec, ctx, attempt)
+        _beat(spec, ctx, attempt, supersede)
 
 
-def _beat(spec: RunSpec, ctx: LaunchContext, attempt: dict[str, Any]) -> None:
+def _beat(
+    spec: RunSpec, ctx: LaunchContext, attempt: dict[str, Any], supersede: Callable[[], None] | None = None
+) -> None:
     try:
         sync_sample_hashes(spec)
         publish_attempt(spec, ctx, dict(attempt) | {"heartbeat": _now()})
+        if supersede is not None and superseded(spec):
+            print(f"[zephon_modal] launch {spec.launch_id} is no longer {spec.run_id}'s current launch", flush=True)
+            supersede()
     except Exception as error:
         print(f"[zephon_modal] heartbeat failed, retrying in {SYNC_SECONDS:.0f}s: {error!r}", flush=True)
 
@@ -426,8 +449,20 @@ def train_node(spec: RunSpec) -> list[str]:
         "outcome": "starting",
     }
     trainer: subprocess.Popen | None = None
-    done = threading.Event()
+    done, was_superseded = threading.Event(), threading.Event()
     heartbeat: threading.Thread | None = None
+    # The heartbeat may stop the trainer too: one stop at a time, and whoever comes second waits for it.
+    stopping = threading.Lock()
+
+    def stop_trainer_once() -> None:
+        with stopping:
+            if trainer is not None and trainer.poll() is None:
+                attempt["returncode"] = stop_trainer(trainer, spec.adapter)
+
+    def supersede() -> None:
+        was_superseded.set()
+        stop_trainer_once()
+
     try:
         # Before anything touches the run, so the reconciler waits for this container.
         publish_attempt(spec, ctx, attempt)
@@ -436,9 +471,12 @@ def train_node(spec: RunSpec) -> list[str]:
         attempt |= resume | {"outcome": "running"}
         trainer = start_trainer(spec, topology)
         publish_attempt(spec, ctx, attempt)
-        heartbeat = threading.Thread(target=_heartbeat, args=(spec, ctx, attempt, done), daemon=True)
+        heartbeat = threading.Thread(target=_heartbeat, args=(spec, ctx, attempt, done, supersede), daemon=True)
         heartbeat.start()
         returncode = trainer.wait()
+        if was_superseded.is_set():
+            attempt["outcome"] = "superseded"
+            raise RuntimeError(f"Launch {spec.launch_id} is no longer {spec.run_id}'s current launch")
         attempt |= {"outcome": "completed" if returncode == 0 else "failed", "returncode": returncode}
         if returncode:
             raise subprocess.CalledProcessError(returncode, trainer.args)
@@ -455,8 +493,7 @@ def train_node(spec: RunSpec) -> list[str]:
             attempt["outcome"] = "failed"
         raise
     finally:
-        if trainer is not None and trainer.poll() is None:
-            attempt["returncode"] = stop_trainer(trainer, spec.adapter)
+        stop_trainer_once()
         done.set()
         if heartbeat is not None:
             heartbeat.join(timeout=2)

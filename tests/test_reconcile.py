@@ -259,15 +259,71 @@ def test_a_restart_gets_a_fresh_stall_budget():
     assert run.state.status == "running"
 
 
-def test_unresponsive_launch_is_cancelled_after_the_heartbeat_timeout():
+def test_silent_launch_is_cancelled_after_the_heartbeat_timeout():
     run = Harness(heartbeat_timeout=300)
     run.tick()
     run.tick(call=Call.RUNNING, attempts=1)
-    run.tick(call=Call.UNKNOWN, error="no heartbeat")
-    run.tick(seconds=200, call=Call.UNKNOWN, error="no heartbeat")
+    run.tick(call=Call.SILENT, error="node 1: no heartbeat for 400s")
+    run.tick(seconds=200, call=Call.SILENT, error="node 1: no heartbeat for 600s")
     assert run.state.status == "running"
-    run.tick(seconds=100, call=Call.UNKNOWN, error="no heartbeat")
+    run.tick(seconds=100, call=Call.SILENT, error="node 1: no heartbeat for 700s")
     assert run.state.status == "draining" and run.backend.cancelled == ["fc-1"]
+    assert run.state.failures == 1
+
+
+def test_a_node_that_comes_back_resets_the_silence():
+    run = Harness(heartbeat_timeout=300)
+    run.tick()
+    run.tick(call=Call.SILENT, error="node 1: no heartbeat")
+    run.tick(seconds=200, call=Call.RUNNING, attempts=1)
+    run.tick(seconds=200, call=Call.SILENT, error="node 1: no heartbeat")
+    assert run.state.status == "running"
+
+
+def test_not_being_able_to_ask_modal_never_cancels():
+    run = Harness(heartbeat_timeout=300, quiet_alert=10**6, stall_timeout=10**6)
+    run.tick()
+    run.tick(call=Call.RUNNING, attempts=1)
+    for _ in range(12):
+        run.tick(seconds=300, call=Call.UNKNOWN, error="ConnectionError: network")
+    assert run.state.status == "running" and run.backend.cancelled == []
+    assert run.events.count("can't observe the launch") == 1
+    run.tick(call=Call.RUNNING, attempts=1)
+    run.tick(call=Call.UNKNOWN, error="ServiceError: unavailable")
+    assert run.events.count("can't observe the launch") == 2
+
+
+def test_launches_lost_by_modal_have_their_own_budget():
+    run = Harness(max_failures=1, max_lost=2)
+    run.tick()
+    run.tick(call=Call.LOST, error="InternalFailure: worker lost")
+    assert (run.state.failures, run.state.lost) == (0, 1)
+    assert run.state.status == "running" and run.placement == SINGLE
+    assert run.state.cooling_until[CLUSTER] > run.now
+    run.tick(call=Call.LOST, error="InternalFailure: worker lost")
+    assert run.state.status == "gave up"
+    assert any("giving up after 2 launches lost by Modal" in alert for alert in run.backend.alerts)
+
+
+def test_a_new_checkpoint_resets_the_lost_count():
+    run = Harness(max_lost=2)
+    run.tick()
+    run.tick(call=Call.LOST, error="InternalFailure")
+    run.tick(call=Call.RUNNING, attempts=1, checkpoint=10)
+    assert run.state.lost == 0
+
+
+def test_a_failed_cancel_changes_nothing():
+    run = Harness(max_failures=2)
+    run.tick()
+
+    def cancel(call_id):
+        raise ConnectionError("cancel RPC failed")
+
+    run.backend.cancel = cancel
+    with pytest.raises(ConnectionError):
+        run.tick(call=Call.FAILED, error="boom")
+    assert run.state.failures == 0 and run.state.status == "running" and run.state.cooling_until == {}
 
 
 def test_stop_cancels_and_waits():
