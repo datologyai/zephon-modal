@@ -22,10 +22,6 @@ RDMA_APT_PACKAGES = ["libibverbs1", "ibverbs-providers", "rdma-core"]
 TORCHTITAN_REPO = "https://github.com/datologyai/torchtitan-zephon"
 TORCHTITAN_COMMIT = os.environ.get("ZEPHON_MODAL_TORCHTITAN_COMMIT", "990bd303f9a5380fb1ca93ed075b03d810c55e13")
 TORCHTITAN_DIR = "/opt/torchtitan"
-# Pinned: torchtitan imports torch_checkpointing APIs that move on main.
-TORCH_CHECKPOINTING_GIT = (
-    "git+https://github.com/meta-pytorch/torch_checkpointing.git@dcbb3a59cfad1cbeb95994f0d6cb1802c1d91825"
-)
 
 # Zephon from PyPI. Checkpoint aggregation through torchrun's TCPStore
 # (aggregate_store="torch://") is in every release since 0.2.0; torchtitan-zephon's
@@ -51,7 +47,7 @@ training_image = (
         f"git clone {TORCHTITAN_REPO} {TORCHTITAN_DIR}",
         f"git -C {TORCHTITAN_DIR} checkout --detach {TORCHTITAN_COMMIT}",
     )
-    # torchtitan-zephon's own requirements, from the clone.
+    # The checkout owns its dependencies, including its compatible torch_checkpointing pin.
     .pip_install("uv")
     .run_commands(
         'uv pip install --python "$(command -v python)" --compile-bytecode '
@@ -61,7 +57,6 @@ training_image = (
     # Following torchtitan-zephon's CI: the nightly torch goes in last so no
     # requirement can downgrade it.
     .uv_pip_install("torch", pre=True, index_url=TORCH_INDEX_URL, extra_options="--reinstall-package torch")
-    .uv_pip_install(TORCH_CHECKPOINTING_GIT, extra_options="--no-deps")
     .run_commands(*DOWNLOAD_TOKENIZERS_COMMANDS)
     .env(
         {
