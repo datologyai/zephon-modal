@@ -115,6 +115,11 @@ reading FineWeb-Edu. It moves between a 2-node H100:8 cluster and a single
 H100:8-or-H100:4 node. Its README walks through staging the data, starting a
 run, checking it, and rehearsing preemptions.
 
+[examples/megatron](examples/megatron/README.md) provides the equivalent
+Qwen3-0.6B job for Megatron-LM-zephon, including a pinned training image,
+data staging and a one-H100 training/checkpoint/resume check with tiny data.
+Sample hashing is an explicit opt-in in that example.
+
 ## Writing your own job
 
 ```python

@@ -109,7 +109,8 @@ stops and restarts them all. zephon-modal makes the restart a clean resume:
   syncs stay small.
 - **Every node resumes from the same checkpoint.** Node 0 sets aside
   incomplete checkpoints (a DCP checkpoint counts only if every shard its
-  `.metadata` lists is present at full length) and commits; the other nodes
+  `.metadata` lists is present at full length, and any
+  `CheckpointLayout.required_torch_files` are readable) and commits; the other nodes
   reload and confirm they see the same latest checkpoint before any trainer
   starts.
 - **Data settings can't change under a run.** `run.json` records the seed and

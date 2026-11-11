@@ -53,11 +53,38 @@ class CheckpointLayout:
         step_pattern: Regex matching one checkpoint's directory name; group 1 is the step.
         tracker: A file naming the latest checkpoint's step, which the trainer
             loads instead of scanning (Megatron's ``latest_checkpointed_iteration.txt``).
+        required_torch_files: Additional ``torch.save`` files, relative to each
+            checkpoint, that must be readable before a checkpoint can be used
+            or count toward retention. Use only files loadable with
+            ``weights_only=True`` (tensors and primitive state).
+        torch_tracker: Optional pair of filenames: a root-level tracker and
+            its checkpoint-local source (e.g. ``latest_train_state.pt`` and
+            ``train_state.pt``). The source must be readable before a save is
+            complete; startup restores the root tracker from the selected save.
     """
 
     subdir: str = "checkpoint"
     step_pattern: str = r"step-(\d+)"
     tracker: str | None = None
+    required_torch_files: tuple[str, ...] = ()
+    torch_tracker: tuple[str, str] | None = None
+
+    def complete(self, path: str) -> bool:
+        """Whether model shards and any separately saved state are complete."""
+        if not dcp_complete(path):
+            return False
+        required = self.required_torch_files + ((self.torch_tracker[1],) if self.torch_tracker else ())
+        if required:
+            import torch
+
+            try:
+                for relative_path in required:
+                    torch.load(os.path.join(path, relative_path), map_location="cpu", weights_only=True)
+            except (FileNotFoundError, EOFError, pickle.UnpicklingError, RuntimeError):
+                # The model write can finish before a separate state write
+                # starts, or a preemption can truncate that state file.
+                return False
+        return True
 
     def steps(self, run_dir: str) -> dict[int, str]:
         """Every checkpoint directory present, complete or not, by step."""
@@ -85,7 +112,7 @@ class CheckpointLayout:
         for step, path in sorted(self.steps(run_dir).items(), reverse=True):
             if len(found) == count:
                 break
-            if dcp_complete(path):
+            if self.complete(path):
                 found.append(step)
         return found
 
@@ -115,7 +142,20 @@ def discard_incomplete(layout: CheckpointLayout, run_dir: str, tag: str) -> Chec
             os.makedirs(target_dir, exist_ok=True)
             os.rename(path, os.path.join(target_dir, f"{os.path.basename(path)}-{tag}"))
             discarded.append(step)
-    if layout.tracker is not None and discarded:
+    if layout.torch_tracker is not None:
+        root_name, local_name = layout.torch_tracker
+        tracker = os.path.join(run_dir, layout.subdir, root_name)
+        if latest is None:
+            if os.path.exists(tracker):
+                os.remove(tracker)
+        else:
+            # The trainer may prefer this file to its text tracker. Copy the
+            # selected checkpoint's exact state, including when the previous
+            # root tracker lagged a completed save at the time of preemption.
+            source = os.path.join(layout.steps(run_dir)[latest], local_name)
+            shutil.copyfile(source, tracker + ".tmp")
+            os.replace(tracker + ".tmp", tracker)
+    if layout.tracker is not None and (discarded or layout.torch_tracker is not None):
         tracker = os.path.join(run_dir, layout.subdir, layout.tracker)
         if latest is None:
             if os.path.exists(tracker):
