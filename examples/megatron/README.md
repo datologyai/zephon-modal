@@ -45,14 +45,10 @@ Changing the commit builds an image from that checkout and its Zephon
 requirements. The base image supplies a compatible CUDA and PyTorch stack;
 select a matching base image when choosing a different framework revision.
 
-The default image uses CUDA 13.4. NVIDIA supports
-[CUDA 13.x minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
-with R580 or newer host drivers, with limits on PTX and newer driver features.
-NGC's startup check may warn when a host driver is older than the image's
-bundled driver. Check the allocated hosts and run a short training/resume
-check before a longer run; the warning alone does not identify which
-compatibility mechanism is active. Keep the image's coupled CUDA, PyTorch
-and Transformer Engine stack together.
+The image uses CUDA 13.4, which can run on R580+ host drivers through
+[minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html),
+subject to NVIDIA's feature limits. Keep NGC's CUDA, PyTorch and Transformer
+Engine stack together, and run the smoke check below before a long run.
 
 ## Short training and resume check
 
