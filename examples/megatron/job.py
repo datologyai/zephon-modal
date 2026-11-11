@@ -32,6 +32,7 @@ def _job(name: str, args: str, lanes: int, placements: list[Placement]) -> Elast
                 step_pattern=r"iter_(\d+)",
                 tracker="latest_checkpointed_iteration.txt",
                 required_torch_files=("mp_rank_00/train_dataloader_dprank000.pt",),
+                torch_tracker=("latest_train_state.pt", "train_state.pt"),
             ),
         ),
         data=Zephon(canonical_replicas=lanes),

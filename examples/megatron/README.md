@@ -102,6 +102,8 @@ optimizer state in the `torch_dist` format, with Zephon state inside each
 `checkpoint/iter_N` directory. A checkpoint is usable only after both the
 model shards and its Zephon state are complete. `--keep-checkpoints` prunes
 them together and preserves the latest resumable checkpoint during a save.
+Startup also restores Megatron's text and training-state trackers from that
+checkpoint, so either tracker selects the same complete save.
 
 `start` leaves a scheduled reconciler deployed. After stopping your runs,
 remove the deployed app when it is no longer needed:

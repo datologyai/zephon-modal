@@ -72,12 +72,16 @@ def test_nothing_to_discard_leaves_tracker_alone(tmp_path):
     assert tracker.read_text() == "10"
 
 
-@pytest.mark.parametrize("state_write", ["missing", "empty", "truncated"])
-def test_megatron_partial_data_save_cannot_replace_the_last_resumable_checkpoint(tmp_path, state_write):
+@pytest.mark.parametrize(
+    ("state_file", "state_write"),
+    [("data", "missing"), ("data", "empty"), ("data", "truncated"), ("train", "missing"), ("train", "truncated")],
+)
+def test_megatron_partial_data_save_cannot_replace_the_last_resumable_checkpoint(tmp_path, state_file, state_write):
     layout = CheckpointLayout(
         step_pattern=r"iter_(\d+)",
         tracker="latest_checkpointed_iteration.txt",
         required_torch_files=("mp_rank_00/train_dataloader_dprank000.pt",),
+        torch_tracker=("latest_train_state.pt", "train_state.pt"),
     )
     paths = {step: tmp_path / "checkpoint" / f"iter_{step:07d}" for step in (10, 20)}
     state_files = {}
@@ -86,12 +90,16 @@ def test_megatron_partial_data_save_cannot_replace_the_last_resumable_checkpoint
         state_files[step] = path / layout.required_torch_files[0]
         state_files[step].parent.mkdir()
         torch.save({"dataloader_state_dict": {"zephon": b"checkpoint"}}, state_files[step])
+        torch.save({"step": torch.tensor(step)}, path / "train_state.pt")
     tracker = tmp_path / "checkpoint" / layout.tracker
     tracker.write_text("20")
+    torch_tracker = tmp_path / "checkpoint" / "latest_train_state.pt"
+    shutil.copyfile(paths[20] / "train_state.pt", torch_tracker)
+    damaged = state_files[20] if state_file == "data" else paths[20] / "train_state.pt"
     if state_write == "missing":
-        state_files[20].unlink()
+        damaged.unlink()
     else:
-        os.truncate(state_files[20], 0 if state_write == "empty" else 100)
+        os.truncate(damaged, 0 if state_write == "empty" else 100)
 
     # Model DCP is complete, but its Zephon state has not safely landed yet.
     assert dcp_complete(str(paths[20]))
@@ -101,19 +109,31 @@ def test_megatron_partial_data_save_cannot_replace_the_last_resumable_checkpoint
     cleanup = discard_incomplete(layout, str(tmp_path), tag="preempted")
     assert (cleanup.latest, cleanup.discarded) == (10, [20])
     assert tracker.read_text() == "10"
+    assert torch.load(torch_tracker, weights_only=True)["step"].item() == 10
 
     # A subsequent complete save can replace the previous model and data state
     # together; no separate dataloader directory accumulates indefinitely.
     _save(paths[20])
     state_files[20].parent.mkdir()
     torch.save({"dataloader_state_dict": {"zephon": b"new checkpoint"}}, state_files[20])
+    torch.save({"step": torch.tensor(20)}, paths[20] / "train_state.pt")
     assert layout.latest_complete(str(tmp_path)) == 20
     assert prune(layout, str(tmp_path), keep=1) == [10]
     assert not paths[10].exists()
     assert state_files[20].is_file()
+    # The root state can also lag a complete save. Even after retention has
+    # pruned its old target, startup repairs both trackers without a discard.
+    assert discard_incomplete(layout, str(tmp_path), tag="resume").discarded == []
+    assert tracker.read_text() == "20"
+    assert torch.load(torch_tracker, weights_only=True)["step"].item() == 20
     # Retain the failed save at the current step for diagnosis; it becomes
     # eligible for cleanup once a newer complete checkpoint is kept.
     assert (tmp_path / DISCARDED_SUBDIR / "iter_0000020-preempted").exists()
+
+    state_files[20].unlink()
+    assert discard_incomplete(layout, str(tmp_path), tag="no-complete-save").latest is None
+    assert not tracker.exists()
+    assert not torch_tracker.exists()
 
 
 def test_prune_keeps_the_latest_complete_checkpoints_and_anything_newer(run_dir):

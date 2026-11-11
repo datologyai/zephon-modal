@@ -111,6 +111,7 @@ def test_jobs_load_and_launch_without_local_framework_checkouts(example, monkeyp
         assert job.runs_volume.name == "test-megatron-runs"
         assert job.volumes["/data"].name == "test-megatron-data"
         assert job.adapter.checkpoints.required_torch_files == ("mp_rank_00/train_dataloader_dprank000.pt",)
+        assert job.adapter.checkpoints.torch_tracker == ("latest_train_state.pt", "train_state.pt")
         command = job.adapter.command(_context(tmp_path, lanes))
         if hashing:
             assert command[:3] == ["-m", "zephon_modal.zephon.megatron_entry", "pretrain_gpt_zephon.py"]
