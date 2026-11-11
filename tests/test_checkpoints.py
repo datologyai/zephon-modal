@@ -72,6 +72,50 @@ def test_nothing_to_discard_leaves_tracker_alone(tmp_path):
     assert tracker.read_text() == "10"
 
 
+@pytest.mark.parametrize("state_write", ["missing", "empty", "truncated"])
+def test_megatron_partial_data_save_cannot_replace_the_last_resumable_checkpoint(tmp_path, state_write):
+    layout = CheckpointLayout(
+        step_pattern=r"iter_(\d+)",
+        tracker="latest_checkpointed_iteration.txt",
+        required_torch_files=("mp_rank_00/train_dataloader_dprank000.pt",),
+    )
+    paths = {step: tmp_path / "checkpoint" / f"iter_{step:07d}" for step in (10, 20)}
+    state_files = {}
+    for step, path in paths.items():
+        _save(path)
+        state_files[step] = path / layout.required_torch_files[0]
+        state_files[step].parent.mkdir()
+        torch.save({"dataloader_state_dict": {"zephon": b"checkpoint"}}, state_files[step])
+    tracker = tmp_path / "checkpoint" / layout.tracker
+    tracker.write_text("20")
+    if state_write == "missing":
+        state_files[20].unlink()
+    else:
+        os.truncate(state_files[20], 0 if state_write == "empty" else 100)
+
+    # Model DCP is complete, but its Zephon state has not safely landed yet.
+    assert dcp_complete(str(paths[20]))
+    assert layout.latest_complete(str(tmp_path)) == 10
+    assert prune(layout, str(tmp_path), keep=1) == []
+    assert state_files[10].is_file()
+    cleanup = discard_incomplete(layout, str(tmp_path), tag="preempted")
+    assert (cleanup.latest, cleanup.discarded) == (10, [20])
+    assert tracker.read_text() == "10"
+
+    # A subsequent complete save can replace the previous model and data state
+    # together; no separate dataloader directory accumulates indefinitely.
+    _save(paths[20])
+    state_files[20].parent.mkdir()
+    torch.save({"dataloader_state_dict": {"zephon": b"new checkpoint"}}, state_files[20])
+    assert layout.latest_complete(str(tmp_path)) == 20
+    assert prune(layout, str(tmp_path), keep=1) == [10]
+    assert not paths[10].exists()
+    assert state_files[20].is_file()
+    # Retain the failed save at the current step for diagnosis; it becomes
+    # eligible for cleanup once a newer complete checkpoint is kept.
+    assert (tmp_path / DISCARDED_SUBDIR / "iter_0000020-preempted").exists()
+
+
 def test_prune_keeps_the_latest_complete_checkpoints_and_anything_newer(run_dir):
     for step in (30, 40):
         _save(run_dir / "checkpoint" / f"step-{step}")

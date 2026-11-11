@@ -98,11 +98,16 @@ def _args(ctx: LaunchContext, *, smoke: bool) -> list[str]:
         "--pipeline-model-parallel-size=1",
         "--context-parallel-size=1",
         "--no-create-attention-mask-in-dataloader",
+        "--reset-position-ids",
+        "--reset-attention-mask",
+        "--dataloader-inter-document-masking",
         f"--zephon-data-config={DATA_RECIPE_PATH}",
         f"--zephon-canonical-replicas={zephon.canonical_replicas}",
         f"--zephon-aggregate-store={zephon.aggregate_store}",
         f"--zephon-run-id={ctx.run_id}",
-        f"--dataloader-save={ctx.run_dir}/dataloader",
+        # Keep data state inside the same iteration directory so completeness
+        # checks and retention cover the entire resumable checkpoint.
+        f"--dataloader-save={ctx.run_dir}/checkpoint",
         f"--save={ctx.run_dir}/checkpoint",
         f"--load={ctx.run_dir}/checkpoint",
         f"--save-interval={2 if smoke else CHECKPOINT_INTERVAL}",

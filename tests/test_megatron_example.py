@@ -72,7 +72,8 @@ def test_recipe_keeps_data_and_checkpoint_settings_across_resume(
     assert flags["--zephon-run-id"] == ctx.run_id
     assert flags["--seed"] == str(ctx.seed)
     assert flags["--save"] == flags["--load"] == f"{ctx.run_dir}/checkpoint"
-    assert flags["--dataloader-save"] == f"{ctx.run_dir}/dataloader"
+    assert flags["--dataloader-save"] == flags["--save"]
+    assert {"--reset-position-ids", "--reset-attention-mask", "--dataloader-inter-document-masking"}.issubset(args)
     assert flags["--ckpt-format"] == "torch_dist"
     assert not {"--no-save-optim", "--no-load-optim", "--no-load-rng"}.intersection(args)
     assert data["seed"] == ctx.seed
@@ -109,6 +110,7 @@ def test_jobs_load_and_launch_without_local_framework_checkouts(example, monkeyp
         assert job.data.canonical_replicas == lanes
         assert job.runs_volume.name == "test-megatron-runs"
         assert job.volumes["/data"].name == "test-megatron-data"
+        assert job.adapter.checkpoints.required_torch_files == ("mp_rank_00/train_dataloader_dprank000.pt",)
         command = job.adapter.command(_context(tmp_path, lanes))
         if hashing:
             assert command[:3] == ["-m", "zephon_modal.zephon.megatron_entry", "pretrain_gpt_zephon.py"]

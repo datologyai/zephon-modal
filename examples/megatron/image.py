@@ -12,6 +12,10 @@ MEGATRON_COMMIT = os.environ.get("ZEPHON_MODAL_MEGATRON_COMMIT", "7ce36bd201921f
 MEGATRON_DIR = "/opt/megatron-lm"
 # Match the checkout's docker/.ngc_version.dev; preserve NGC's coupled
 # PyTorch, Transformer Engine, Apex and FlashAttention installations.
+# CUDA 13.x supports minor-version compatibility with R580+ host drivers,
+# subject to PTX/new-driver feature limits. An NGC driver preflight warning
+# does not establish whether forward-compat libraries are actually loaded.
+# See README.md for compatibility guidance and validate on the target hosts.
 BASE_IMAGE = os.environ.get("ZEPHON_MODAL_MEGATRON_BASE_IMAGE", "nvcr.io/nvidia/pytorch:26.09-py3")
 ZEPHON_SPEC = "zephon[hf,cloud,parquet]==0.2.1"
 HF_ASSETS_DIR = "/assets/hf"

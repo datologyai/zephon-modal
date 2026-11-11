@@ -10,6 +10,7 @@ from image import MEGATRON_DIR, training_image
 from storage import DATA_MOUNT, data_volume, runs_volume
 
 from zephon_modal import ElasticJob, Megatron, Placement
+from zephon_modal.checkpoints import CheckpointLayout
 from zephon_modal.zephon import Zephon
 
 PREFIX = os.environ.get("ZEPHON_MODAL_MEGATRON_PREFIX", "zephon-modal-megatron")
@@ -27,6 +28,11 @@ def _job(name: str, args: str, lanes: int, placements: list[Placement]) -> Elast
             script="pretrain_gpt_zephon.py",
             entry=HASHING_ENTRY,
             megatron_dir=MEGATRON_DIR,
+            checkpoints=CheckpointLayout(
+                step_pattern=r"iter_(\d+)",
+                tracker="latest_checkpointed_iteration.txt",
+                required_torch_files=("mp_rank_00/train_dataloader_dprank000.pt",),
+            ),
         ),
         data=Zephon(canonical_replicas=lanes),
         placements=placements,

@@ -2,6 +2,8 @@
 
 Train Qwen3-0.6B from scratch on [Megatron-LM-zephon](https://github.com/datologyai/Megatron-LM-zephon),
 using its Hugging Face tokenizer and FineWeb-Edu `sample-10BT` through Zephon.
+Packed documents have separate attention boundaries and reset position IDs,
+matching the TorchTitan example's document isolation.
 The job can move between two H100:8 nodes and one H100:8 or H100:4 node.
 A separate `smoke` job runs the same model on one H100 with short sequences
 and a tiny generated dataset.
@@ -43,6 +45,15 @@ Changing the commit builds an image from that checkout and its Zephon
 requirements. The base image supplies a compatible CUDA and PyTorch stack;
 select a matching base image when choosing a different framework revision.
 
+The default image uses CUDA 13.4. NVIDIA supports
+[CUDA 13.x minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+with R580 or newer host drivers, with limits on PTX and newer driver features.
+NGC's startup check may warn when a host driver is older than the image's
+bundled driver. Check the allocated hosts and run a short training/resume
+check before a longer run; the warning alone does not identify which
+compatibility mechanism is active. Keep the image's coupled CUDA, PyTorch
+and Transformer Engine stack together.
+
 ## Short training and resume check
 
 Generate a small Parquet dataset, then train two steps and resume the same
@@ -79,11 +90,18 @@ uv run python -m zephon_modal status examples/megatron/job.py --run-id <you>-qwe
 uv run python -m zephon_modal stop examples/megatron/job.py --run-id <you>-qwen3
 ```
 
+If you already staged FineWeb-Edu for the TorchTitan example, set
+`ZEPHON_MODAL_MEGATRON_DATA_VOLUME` to that data Volume's name and skip
+`stage_data.py`. Both examples use `/data/fineweb-edu/sample-10BT` and read
+the same Parquet shards and Zephon index without rewriting the data.
+
 The two-node placement requires Modal multi-node support. The job uses 16
 Zephon lanes and 64 global microbatches per optimizer step, so each step
 consumes whole lane windows at DP 16, 8 or 4. Megatron saves model and
-optimizer state in the `torch_dist` format and saves Zephon state under the
-same run directory. Checkpoint pruning is handled by `--keep-checkpoints`.
+optimizer state in the `torch_dist` format, with Zephon state inside each
+`checkpoint/iter_N` directory. A checkpoint is usable only after both the
+model shards and its Zephon state are complete. `--keep-checkpoints` prunes
+them together and preserves the latest resumable checkpoint during a save.
 
 `start` leaves a scheduled reconciler deployed. After stopping your runs,
 remove the deployed app when it is no longer needed:
